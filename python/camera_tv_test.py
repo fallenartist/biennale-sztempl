@@ -1,4 +1,25 @@
-#!/usr/bin/env python3
+def update_fps(self):
+		"""Update FPS calculation"""
+		import time
+		current_time = time.time()
+		self.frame_times = getattr(self, 'frame_times', [])
+		self.frame_times.append(current_time)
+		self.frame_count = getattr(self, 'frame_count', 0) + 1
+
+		# Keep only recent frame times (last 30 frames)
+		fps_update_interval = 30
+		if len(self.frame_times) > fps_update_interval:
+			self.frame_times.pop(0)
+
+		# Calculate FPS every few frames
+		if self.frame_count % 10 == 0 and len(self.frame_times) > 1:
+			time_span = self.frame_times[-1] - self.frame_times[0]
+			if time_span > 0:
+				self.current_fps = (len(self.frame_times) - 1) / time_span
+			else:
+				self.current_fps = 0.0
+		elif not hasattr(self, 'current_fps'):
+			self.current_fps = 0.0#!/usr/bin/env python3
 """
 Simplified Face & Shoulders Detection
 Based on biennale_draft.py - removed PRNG/tiles, focused on pose detection
@@ -24,7 +45,7 @@ class FaceShoulderApp:
 		self.fullhd_width = 1920
 		self.fullhd_height = 1080
 		self.rotate_90_degrees = True  # Set to True for vertical TV orientation
-		self.mirror_vertically = False  # Set to True to mirror image vertically
+		self.mirror_horizontally = True  # Set to True to mirror image horizontally
 
 		# If rotated, swap width/height for display
 		if self.rotate_90_degrees:
@@ -44,8 +65,18 @@ class FaceShoulderApp:
 		self.crop_padding_factor = 0.2      # 20% padding around detected area
 
 		# Camera settings
-		self.camera_input_size = (640, 480)  # IMX500 input resolution
+		self.camera_resolution = (2028, 1520)  # Actual camera capture resolution (W, H) - can be changed
 		self.pose_model_path = "/usr/share/imx500-models/imx500_network_higherhrnet_coco.rpk"
+
+		# IMX500 pose estimation model expects input in (Height, Width) format
+		# This should match the camera resolution but in H,W format for the model
+		self.WINDOW_SIZE_H_W = (self.camera_resolution[1], self.camera_resolution[0])  # Auto-match camera resolution
+
+		# FPS tracking
+		self.frame_times = []
+		self.fps_update_interval = 30  # Update FPS every 30 frames
+		self.frame_count = 0
+		self.current_fps = 0.0
 
 		# Colors
 		self.black = (0, 0, 0)
@@ -70,9 +101,6 @@ class FaceShoulderApp:
 		self.pose_detected = False
 		self.current_frame = None
 
-		# Window size for pose estimation (matching demo)
-		self.WINDOW_SIZE_H_W = (480, 640)
-
 		# Initialize IMX500 camera with pose estimation
 		self.setup_imx500_camera()
 
@@ -81,7 +109,7 @@ class FaceShoulderApp:
 
 		print(f"Display setup: {self.display_width}x{self.display_height}")
 		print(f"Rotation: {'90° (vertical TV)' if self.rotate_90_degrees else 'none (horizontal)'}")
-		print(f"Mirror: {'enabled' if self.mirror_vertically else 'disabled'}")
+		print(f"Mirror: {'enabled' if self.mirror_horizontally else 'disabled'}")
 
 	def setup_imx500_camera(self):
 		"""Initialize IMX500 camera with pose estimation model"""
@@ -96,16 +124,21 @@ class FaceShoulderApp:
 			elif self.intrinsics.task != "pose estimation":
 				print("Warning: Network is not a pose estimation task", file=sys.stderr)
 
-			# Set defaults
+			# Set defaults - optimize for higher frame rate
 			if self.intrinsics.inference_rate is None:
-				self.intrinsics.inference_rate = 15  # Slightly higher for smoother video
+				self.intrinsics.inference_rate = 30  # Higher FPS for smoother video
 
 			self.intrinsics.update_with_defaults()
 
-			# Initialize camera
+			# Initialize camera with optimized settings
 			self.picam2 = Picamera2(self.imx500.camera_num)
+
+			# Use higher resolution for better quality - IMX500 supports:
+			# - 4056x3040 @ 10fps (full resolution)
+			# - 2028x1520 @ 40fps (2x2 binned)
+			# - Custom lower resolutions at higher fps
 			config = self.picam2.create_preview_configuration(
-				main={"size": self.camera_input_size, "format": "RGB888"},
+				main={"size": self.camera_resolution, "format": "RGB888"},
 				controls={'FrameRate': self.intrinsics.inference_rate},
 				buffer_count=12
 			)
@@ -121,6 +154,15 @@ class FaceShoulderApp:
 			self.imx500.set_auto_aspect_ratio()
 
 			print("IMX500 pose estimation initialized successfully")
+			print(f"Camera resolution: {config['main']['size']}")
+			print(f"Pose model window size: {self.WINDOW_SIZE_H_W}")
+			print(f"Inference rate: {self.intrinsics.inference_rate} fps")
+
+			# Store the actual camera resolution for coordinate calculations
+			self.actual_camera_resolution = config['main']['size']
+
+			# Update WINDOW_SIZE_H_W to match actual camera resolution
+			self.WINDOW_SIZE_H_W = (self.actual_camera_resolution[1], self.actual_camera_resolution[0])
 
 		except Exception as e:
 			print(f"Failed to initialize IMX500: {e}")
@@ -128,11 +170,32 @@ class FaceShoulderApp:
 			# Fallback to regular camera
 			self.picam2 = Picamera2()
 			config = self.picam2.create_preview_configuration(
-				main={"size": self.camera_input_size, "format": "RGB888"}
+				main={"size": self.camera_resolution, "format": "RGB888"}
 			)
 			self.picam2.configure(config)
 			self.picam2.start()
 			self.imx500 = None
+			# Store the actual camera resolution for coordinate calculations
+			self.actual_camera_resolution = self.camera_resolution
+			# Update WINDOW_SIZE_H_W to match actual camera resolution
+			self.WINDOW_SIZE_H_W = (self.actual_camera_resolution[1], self.actual_camera_resolution[0])
+
+	def update_fps(self):
+		"""Update FPS calculation"""
+		import time
+		current_time = time.time()
+		self.frame_times.append(current_time)
+		self.frame_count += 1
+
+		# Keep only recent frame times (last 30 frames)
+		if len(self.frame_times) > self.fps_update_interval:
+			self.frame_times.pop(0)
+
+		# Calculate FPS every few frames
+		if self.frame_count % 10 == 0 and len(self.frame_times) > 1:
+			time_span = self.frame_times[-1] - self.frame_times[0]
+			if time_span > 0:
+				self.current_fps = (len(self.frame_times) - 1) / time_span
 
 	def ai_output_tensor_parse(self, request: CompletedRequest):
 		"""Parse the pose estimation output tensor and capture frame"""
@@ -167,17 +230,22 @@ class FaceShoulderApp:
 					self.last_boxes = [np.array(b) for b in boxes]
 					self.last_scores = scores
 					self.pose_detected = True
+					# Calculate crop region ONCE when pose data is updated
+					self.current_frame_crop_region = self._calculate_face_shoulder_crop_region()
 				else:
 					self.pose_detected = False
+					self.current_frame_crop_region = None
 			else:
 				self.pose_detected = False
+				self.current_frame_crop_region = None
 
 		except Exception as e:
 			print(f"Error parsing pose results: {e}")
 			self.pose_detected = False
+			self.current_frame_crop_region = None
 
-	def get_face_shoulder_crop_region(self):
-		"""Calculate crop region focusing only on face and shoulders with smaller margins"""
+	def _calculate_face_shoulder_crop_region(self):
+		"""Calculate crop region focusing only on face and shoulders with aspect ratio preservation"""
 		if not self.pose_detected or self.last_keypoints is None or len(self.last_scores) == 0:
 			return None
 
@@ -217,19 +285,62 @@ class FaceShoulderApp:
 			min_y = min(y_coords)
 			max_y = max(y_coords)
 
-			# Add smaller margins as requested
+			# Add margins as configured
 			width = max_x - min_x
 			height = max_y - min_y
 
-			# Apply smaller padding
+			# Apply padding
 			padding_x = width * self.crop_padding_factor
 			padding_y = height * self.crop_padding_factor
 
-			# Calculate crop region with smaller margins
+			# Calculate initial crop region
 			crop_x = max(0, min_x - padding_x)
 			crop_y = max(0, min_y - padding_y)
-			crop_w = min(self.camera_input_size[0] - crop_x, width + 2 * padding_x)
-			crop_h = min(self.camera_input_size[1] - crop_y, height + 2 * padding_y)
+			crop_w = min(self.camera_resolution[0] - crop_x, width + 2 * padding_x)
+			crop_h = min(self.camera_resolution[1] - crop_y, height + 2 * padding_y)
+
+			# Adjust crop to maintain aspect ratio without distortion
+			display_aspect = self.display_width / self.display_height
+			crop_aspect = crop_w / crop_h
+
+			if crop_aspect > display_aspect:
+				# Crop is wider than display, adjust height
+				new_crop_h = crop_w / display_aspect
+				height_diff = new_crop_h - crop_h
+				crop_y = max(0, crop_y - height_diff / 2)
+				crop_h = min(self.camera_resolution[1] - crop_y, new_crop_h)
+				# If we hit the edge, adjust width instead
+				if crop_y + crop_h > self.camera_resolution[1]:
+					crop_h = self.camera_resolution[1] - crop_y
+					crop_w = crop_h * display_aspect
+					width_diff = (min(self.camera_resolution[0] - crop_x, crop_w) - crop_w) / 2
+					crop_x = max(0, crop_x + width_diff)
+			else:
+				# Crop is taller than display, adjust width
+				new_crop_w = crop_h * display_aspect
+				width_diff = new_crop_w - crop_w
+				crop_x = max(0, crop_x - width_diff / 2)
+				crop_w = min(self.camera_resolution[0] - crop_x, new_crop_w)
+				# If we hit the edge, adjust height instead
+				if crop_x + crop_w > self.camera_resolution[0]:
+					crop_w = self.camera_resolution[0] - crop_x
+					crop_h = crop_w / display_aspect
+					height_diff = (min(self.camera_resolution[1] - crop_y, crop_h) - crop_h) / 2
+					crop_y = max(0, crop_y + height_diff)
+
+			# Debug output
+			if self.debug_mode and self.frame_count % 30 == 0:  # Print every 30 frames
+				print(f"DEBUG: Original bbox: ({min_x:.1f}, {min_y:.1f}) -> ({max_x:.1f}, {max_y:.1f})")
+				print(f"DEBUG: Final crop region: ({int(crop_x)}, {int(crop_y)}, {int(crop_w)}, {int(crop_h)})")
+				print(f"DEBUG: Display aspect: {display_aspect:.3f}, Crop aspect: {crop_w/crop_h:.3f}")
+				print(f"DEBUG: Valid points: {len(valid_points)}, Camera res: {self.camera_resolution}")
+
+			# Debug output
+			if self.debug_mode and self.frame_count % 30 == 0:  # Print every 30 frames
+				print(f"DEBUG: Original bbox: ({min_x:.1f}, {min_y:.1f}) -> ({max_x:.1f}, {max_y:.1f})")
+				print(f"DEBUG: Final crop region: ({int(crop_x)}, {int(crop_y)}, {int(crop_w)}, {int(crop_h)})")
+				print(f"DEBUG: Display aspect: {display_aspect:.3f}, Crop aspect: {crop_w/crop_h:.3f}")
+				print(f"DEBUG: Valid points: {len(valid_points)}, Camera res: {self.camera_resolution}")
 
 			return (int(crop_x), int(crop_y), int(crop_w), int(crop_h))
 
@@ -237,8 +348,44 @@ class FaceShoulderApp:
 			print(f"Error calculating crop region: {e}")
 			return None
 
+	def get_face_shoulder_crop_region(self):
+		"""Return the cached crop region calculated when pose data was updated"""
+		return getattr(self, 'current_frame_crop_region', None)
+
+	def scale_with_aspect_ratio(self, surface, target_width, target_height):
+		"""Scale surface to fit target dimensions while maintaining aspect ratio"""
+		source_width, source_height = surface.get_size()
+		source_aspect = source_width / source_height
+		target_aspect = target_width / target_height
+
+		if source_aspect > target_aspect:
+			# Source is wider, fit to width
+			new_width = target_width
+			new_height = int(target_width / source_aspect)
+		else:
+			# Source is taller, fit to height
+			new_height = target_height
+			new_width = int(target_height * source_aspect)
+
+		# Scale the surface
+		scaled_surface = pygame.transform.scale(surface, (new_width, new_height))
+
+		# Create final surface with black background
+		final_surface = pygame.Surface((target_width, target_height))
+		final_surface.fill(self.black)
+
+		# Center the scaled surface
+		x_offset = (target_width - new_width) // 2
+		y_offset = (target_height - new_height) // 2
+		final_surface.blit(scaled_surface, (x_offset, y_offset))
+
+		return final_surface
+
 	def draw_video_display(self):
 		"""Draw the main video display with face/shoulder cropping"""
+		# Update FPS tracking
+		self.update_fps()
+
 		# Clear screen
 		self.screen.fill(self.black)
 
@@ -253,31 +400,53 @@ class FaceShoulderApp:
 		try:
 			# Convert OpenCV frame to Pygame surface
 			frame_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+
+			# DEBUG: Check if the coordinate system is wrong here
+			if self.debug_mode and self.frame_count % 30 == 0:
+				print(f"DEBUG: Original frame shape (OpenCV): {self.current_frame.shape}")  # Should be (768, 1024, 3)
+				print(f"DEBUG: Frame RGB shape: {frame_rgb.shape}")
+
 			frame_surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
 
-			# Get crop region if pose detected
+			if self.debug_mode and self.frame_count % 30 == 0:
+				print(f"DEBUG: Final frame surface size (pygame): {frame_surface.get_size()}")  # Should be (1024, 768)
+
+			# Get crop region - should be the same cached value for entire frame
 			crop_region = self.get_face_shoulder_crop_region()
+
+			# Store crop region for debug overlay to use the same value
+			# (This should already be the same, but ensuring consistency)
 
 			if crop_region and self.pose_detected:
 				# Crop to face and shoulders area
 				crop_x, crop_y, crop_w, crop_h = crop_region
 
-				# Create cropped surface
-				cropped_surface = pygame.Surface((crop_w, crop_h))
-				cropped_surface.blit(frame_surface, (0, 0), (crop_x, crop_y, crop_w, crop_h))
+				# Debug output for video cropping
+				if self.debug_mode and self.frame_count % 30 == 0:
+					print(f"DEBUG: Video display using crop region: {crop_region}")
+					print(f"DEBUG: Frame surface size: {frame_surface.get_size()}")
 
-				# Scale cropped area to fill display
+				# Create cropped surface
 				if crop_w > 0 and crop_h > 0:
+					cropped_surface = pygame.Surface((crop_w, crop_h))
+					cropped_surface.blit(frame_surface, (0, 0), (crop_x, crop_y, crop_w, crop_h))
+
+					# Scale cropped area to fill display (already aspect-ratio corrected)
 					display_surface = pygame.transform.scale(cropped_surface, (self.display_width, self.display_height))
+
+					if self.debug_mode and self.frame_count % 30 == 0:
+						print(f"DEBUG: Cropped surface size: {cropped_surface.get_size()}")
+						print(f"DEBUG: Final display size: {display_surface.get_size()}")
 				else:
-					display_surface = pygame.transform.scale(frame_surface, (self.display_width, self.display_height))
+					# Fallback to full frame with aspect ratio preserved
+					display_surface = self.scale_with_aspect_ratio(frame_surface, self.display_width, self.display_height)
 			else:
-				# No pose detected, show full frame scaled
-				display_surface = pygame.transform.scale(frame_surface, (self.display_width, self.display_height))
+				# No pose detected, show full frame with aspect ratio preserved
+				display_surface = self.scale_with_aspect_ratio(frame_surface, self.display_width, self.display_height)
 
 			# Apply mirroring if needed
-			if self.mirror_vertically:
-				display_surface = pygame.transform.flip(display_surface, False, True)  # Flip vertically
+			if self.mirror_horizontally:
+				display_surface = pygame.transform.flip(display_surface, True, False)  # Flip horizontally
 
 			# Apply rotation if needed
 			if self.rotate_90_degrees:
@@ -321,8 +490,16 @@ class FaceShoulderApp:
 			# COCO keypoint indices we care about:
 			# 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear
 			# 5: left_shoulder, 6: right_shoulder
-			keypoint_names = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear', 'left_shoulder', 'right_shoulder']
+			keypoint_names = ['nose', 'L eye', 'R eye', 'L ear', 'R ear', 'L shoulder', 'R shoulder']
 			target_indices = [0, 1, 2, 3, 4, 5, 6]
+
+			# Get crop region once to ensure consistency between video and debug overlay
+			# Use the same crop region that was calculated when pose data was updated
+			crop_region = self.get_face_shoulder_crop_region()
+
+			# Debug output for this specific crop calculation
+			if self.debug_mode and crop_region and self.frame_count % 30 == 0:
+				print(f"DEBUG: Debug overlay using EXACT SAME cached crop region: {crop_region}")
 
 			# Convert keypoints to screen coordinates
 			screen_points = {}
@@ -330,25 +507,28 @@ class FaceShoulderApp:
 				if idx < len(person_keypoints):
 					kp_x, kp_y, visibility = person_keypoints[idx]
 					if visibility > self.visibility_threshold:
-						# Convert from camera coordinates to display coordinates
-						# Account for any cropping, scaling, mirroring, and rotation
+						# Debug: print raw coordinates occasionally
+						if self.debug_mode and self.frame_count % 60 == 0 and idx == 0:  # Print nose coordinates every 60 frames
+							print(f"DEBUG: Nose keypoint: ({kp_x:.1f}, {kp_y:.1f}) in camera space {self.camera_resolution}")
+							print(f"DEBUG: Using crop region from video: {crop_region}")
 
-						# First, get the crop region to understand the scaling
-						crop_region = self.get_face_shoulder_crop_region()
-
+						# Convert coordinates to display space
 						if crop_region:
 							crop_x, crop_y, crop_w, crop_h = crop_region
-							# Convert to cropped coordinates
-							screen_x = (kp_x - crop_x) / crop_w * self.display_width
-							screen_y = (kp_y - crop_y) / crop_h * self.display_height
+							# Convert to cropped coordinates first
+							relative_x = (kp_x - crop_x) / crop_w
+							relative_y = (kp_y - crop_y) / crop_h
+							# Then scale to display size
+							screen_x = relative_x * self.display_width
+							screen_y = relative_y * self.display_height
 						else:
-							# No crop, scale from full camera input
-							screen_x = kp_x / self.camera_input_size[0] * self.display_width
-							screen_y = kp_y / self.camera_input_size[1] * self.display_height
+							# No crop, scale directly from camera to display
+							screen_x = (kp_x / self.camera_resolution[0]) * self.display_width
+							screen_y = (kp_y / self.camera_resolution[1]) * self.display_height
 
 						# Apply mirroring if enabled (before rotation)
-						if self.mirror_vertically:
-							screen_y = self.display_height - screen_y
+						if self.mirror_horizontally:
+							screen_x = self.display_width - screen_x
 
 						# Apply rotation coordinates if enabled
 						if self.rotate_90_degrees:
@@ -364,7 +544,7 @@ class FaceShoulderApp:
 						screen_points[idx] = (int(screen_x), int(screen_y))
 
 			# Draw connection lines
-			line_width = 3
+			line_width = 2
 
 			# Face connections: nose to eyes to ears
 			face_connections = [
@@ -407,7 +587,7 @@ class FaceShoulderApp:
 
 					# Draw label
 					font = pygame.font.Font(None, 24)
-					text = font.render(keypoint_names[i][:4], True, color)
+					text = font.render(keypoint_names[i], True, color)
 					label_x = screen_points[idx][0] + 12
 					label_y = screen_points[idx][1] - 12
 					self.screen.blit(text, (label_x, label_y))
@@ -415,41 +595,38 @@ class FaceShoulderApp:
 		except Exception as e:
 			print(f"Error drawing pose debug overlay: {e}")
 
+	def draw_rotated_text(self, text, font, color, x, y):
+		"""Draw text that matches the video rotation"""
+		text_surface = font.render(text, True, color)
+		if self.rotate_90_degrees:
+			# Rotate text 90 degrees to match video rotation
+			text_surface = pygame.transform.rotate(text_surface, 90)
+		return text_surface
+
 	def draw_status_overlay(self):
-		"""Draw status information overlay"""
+		"""Draw minimal status overlay - just FPS and camera resolution"""
 		font = pygame.font.Font(None, 48)
 
-		# Pose detection status
-		status_text = "FACE & SHOULDERS DETECTED" if self.pose_detected else "SEARCHING FOR PERSON..."
-		status_color = self.green if self.pose_detected else self.white
-
-		text = font.render(status_text, True, status_color)
-
-		# Position in corner (adjust for rotation)
+		# FPS display
+		fps_text = f"FPS: {getattr(self, 'current_fps', 0.0):.1f}"
 		if self.rotate_90_degrees:
-			text_pos = (20, self.display_height - 60)
+		   fps_surface = self.draw_rotated_text(fps_text, font, self.white, 0, 0)
+		   fps_pos = (self.display_width - 20, 20)
 		else:
-			text_pos = (20, 20)
+		   fps_surface = font.render(fps_text, True, self.white)
+		   fps_pos = (self.display_width - 200, 20)
+		self.screen.blit(fps_surface, fps_pos)
 
-		self.screen.blit(text, text_pos)
-
-		# Debug mode indicator
-		if self.debug_mode:
-			debug_text = font.render("DEBUG MODE", True, self.red)
-			if self.rotate_90_degrees:
-				debug_pos = (20, self.display_height - 120)
-			else:
-				debug_pos = (20, 80)
-			self.screen.blit(debug_text, debug_pos)
-
-		# Mirror indicator
-		if self.mirror_vertically:
-			mirror_text = font.render("MIRRORED", True, self.white)
-			if self.rotate_90_degrees:
-				mirror_pos = (20, self.display_height - 180)
-			else:
-				mirror_pos = (20, 140)
-			self.screen.blit(mirror_text, mirror_pos)
+		# Camera resolution display (always show for reference)
+		if hasattr(self, 'actual_camera_resolution'):
+		   res_text = f"CAM: {self.actual_camera_resolution[0]}x{self.actual_camera_resolution[1]}"
+		   if self.rotate_90_degrees:
+			   res_surface = self.draw_rotated_text(res_text, font, self.white, 0, 0)
+			   res_pos = (self.display_width - 20, 20 + fps_surface.get_width() + 10)
+		   else:
+			   res_surface = font.render(res_text, True, self.white)
+			   res_pos = (self.display_width - 300, 70)
+		   self.screen.blit(res_surface, res_pos)
 
 	def handle_events(self):
 		"""Handle pygame events"""
@@ -476,10 +653,14 @@ class FaceShoulderApp:
 					else:
 						self.display_width = self.fullhd_width
 						self.display_height = self.fullhd_height
+
+					# Clear screen to remove any text artifacts
+					self.screen.fill(self.black)
+					pygame.display.flip()
 				elif event.key == pygame.K_m:
-					# Toggle vertical mirroring
-					self.mirror_vertically = not self.mirror_vertically
-					print(f"Mirror: {'enabled' if self.mirror_vertically else 'disabled'}")
+					# Toggle horizontal mirroring
+					self.mirror_horizontally = not self.mirror_horizontally
+					print(f"Mirror: {'enabled' if self.mirror_horizontally else 'disabled'}")
 
 		return True
 
@@ -491,7 +672,7 @@ class FaceShoulderApp:
 		print("- ESC: Exit")
 		print("- 'd': Toggle debug mode (show pose keypoints and connections)")
 		print("- 'r': Toggle 90° rotation for vertical TV")
-		print("- 'm': Toggle vertical mirroring")
+		print("- 'm': Toggle horizontal mirroring")
 		print(f"IMX500 status: {'Available' if self.imx500 else 'Not available'}")
 		print(f"Target: Face and shoulders detection at {self.display_width}x{self.display_height}")
 
@@ -504,9 +685,18 @@ class FaceShoulderApp:
 			self.clock.tick(30)  # 30 FPS for smooth video
 
 		# Cleanup
-		if self.picam2:
-			self.picam2.stop()
-		pygame.quit()
+		try:
+			if hasattr(self, 'picam2') and self.picam2:
+				self.picam2.stop()
+		except Exception as e:
+			print(f"Warning: Error stopping camera: {e}")
+
+		try:
+			pygame.quit()
+		except Exception as e:
+			print(f"Warning: Error closing pygame: {e}")
+
+		print("Application closed successfully")
 
 if __name__ == "__main__":
 	try:
