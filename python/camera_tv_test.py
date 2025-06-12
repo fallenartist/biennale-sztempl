@@ -24,6 +24,7 @@ class FaceShoulderApp:
 		self.fullhd_width = 1920
 		self.fullhd_height = 1080
 		self.rotate_90_degrees = True  # Set to True for vertical TV orientation
+		self.mirror_vertically = False  # Set to True to mirror image vertically
 
 		# If rotated, swap width/height for display
 		if self.rotate_90_degrees:
@@ -80,6 +81,7 @@ class FaceShoulderApp:
 
 		print(f"Display setup: {self.display_width}x{self.display_height}")
 		print(f"Rotation: {'90° (vertical TV)' if self.rotate_90_degrees else 'none (horizontal)'}")
+		print(f"Mirror: {'enabled' if self.mirror_vertically else 'disabled'}")
 
 	def setup_imx500_camera(self):
 		"""Initialize IMX500 camera with pose estimation model"""
@@ -273,12 +275,20 @@ class FaceShoulderApp:
 				# No pose detected, show full frame scaled
 				display_surface = pygame.transform.scale(frame_surface, (self.display_width, self.display_height))
 
+			# Apply mirroring if needed
+			if self.mirror_vertically:
+				display_surface = pygame.transform.flip(display_surface, False, True)  # Flip vertically
+
 			# Apply rotation if needed
 			if self.rotate_90_degrees:
 				display_surface = pygame.transform.rotate(display_surface, 90)
 
 			# Draw to screen
 			self.screen.blit(display_surface, (0, 0))
+
+			# Draw debug overlay if enabled
+			if self.debug_mode:
+				self.draw_pose_debug_overlay()
 
 			# Draw status overlay
 			self.draw_status_overlay()
@@ -290,6 +300,120 @@ class FaceShoulderApp:
 			text = font.render(f"Video error: {str(e)}", True, self.red)
 			text_rect = text.get_rect(center=(self.display_width//2, self.display_height//2))
 			self.screen.blit(text, text_rect)
+
+	def draw_pose_debug_overlay(self):
+		"""Draw pose keypoints and connections for debugging"""
+		if not self.pose_detected or self.last_keypoints is None or len(self.last_scores) == 0:
+			return
+
+		try:
+			# Find person with highest confidence
+			best_person_idx = np.argmax(self.last_scores)
+
+			if best_person_idx >= len(self.last_keypoints):
+				return
+
+			person_keypoints = self.last_keypoints[best_person_idx]
+
+			if len(person_keypoints) < 17:
+				return
+
+			# COCO keypoint indices we care about:
+			# 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear
+			# 5: left_shoulder, 6: right_shoulder
+			keypoint_names = ['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear', 'left_shoulder', 'right_shoulder']
+			target_indices = [0, 1, 2, 3, 4, 5, 6]
+
+			# Convert keypoints to screen coordinates
+			screen_points = {}
+			for i, idx in enumerate(target_indices):
+				if idx < len(person_keypoints):
+					kp_x, kp_y, visibility = person_keypoints[idx]
+					if visibility > self.visibility_threshold:
+						# Convert from camera coordinates to display coordinates
+						# Account for any cropping, scaling, mirroring, and rotation
+
+						# First, get the crop region to understand the scaling
+						crop_region = self.get_face_shoulder_crop_region()
+
+						if crop_region:
+							crop_x, crop_y, crop_w, crop_h = crop_region
+							# Convert to cropped coordinates
+							screen_x = (kp_x - crop_x) / crop_w * self.display_width
+							screen_y = (kp_y - crop_y) / crop_h * self.display_height
+						else:
+							# No crop, scale from full camera input
+							screen_x = kp_x / self.camera_input_size[0] * self.display_width
+							screen_y = kp_y / self.camera_input_size[1] * self.display_height
+
+						# Apply mirroring if enabled (before rotation)
+						if self.mirror_vertically:
+							screen_y = self.display_height - screen_y
+
+						# Apply rotation coordinates if enabled
+						if self.rotate_90_degrees:
+							# 90° rotation: (x,y) -> (y, display_width-x)
+							rotated_x = screen_y
+							rotated_y = self.display_width - screen_x
+							screen_x, screen_y = rotated_x, rotated_y
+
+						# Clamp to screen bounds
+						screen_x = max(0, min(self.display_width - 1, screen_x))
+						screen_y = max(0, min(self.display_height - 1, screen_y))
+
+						screen_points[idx] = (int(screen_x), int(screen_y))
+
+			# Draw connection lines
+			line_width = 3
+
+			# Face connections: nose to eyes to ears
+			face_connections = [
+				(0, 1),  # nose to left_eye
+				(0, 2),  # nose to right_eye
+				(1, 3),  # left_eye to left_ear
+				(2, 4),  # right_eye to right_ear
+			]
+
+			# Shoulder connection
+			shoulder_connections = [
+				(5, 6),  # left_shoulder to right_shoulder
+			]
+
+			# Draw face connections in white
+			for start_idx, end_idx in face_connections:
+				if start_idx in screen_points and end_idx in screen_points:
+					pygame.draw.line(self.screen, self.white,
+								   screen_points[start_idx], screen_points[end_idx], line_width)
+
+			# Draw shoulder connections in green
+			for start_idx, end_idx in shoulder_connections:
+				if start_idx in screen_points and end_idx in screen_points:
+					pygame.draw.line(self.screen, self.green,
+								   screen_points[start_idx], screen_points[end_idx], line_width)
+
+			# Draw keypoints as circles
+			keypoint_radius = 8
+			for i, idx in enumerate(target_indices):
+				if idx in screen_points:
+					# Color code keypoints
+					if idx == 0:  # nose
+						color = self.red
+					elif idx in [1, 2, 3, 4]:  # eyes and ears
+						color = self.white
+					else:  # shoulders
+						color = self.green
+
+					pygame.draw.circle(self.screen, color, screen_points[idx], keypoint_radius)
+
+					# Draw label
+					font = pygame.font.Font(None, 24)
+					text = font.render(keypoint_names[i][:4], True, color)
+					label_x = screen_points[idx][0] + 12
+					label_y = screen_points[idx][1] - 12
+					self.screen.blit(text, (label_x, label_y))
+
+		except Exception as e:
+			print(f"Error drawing pose debug overlay: {e}")
 
 	def draw_status_overlay(self):
 		"""Draw status information overlay"""
@@ -318,6 +442,15 @@ class FaceShoulderApp:
 				debug_pos = (20, 80)
 			self.screen.blit(debug_text, debug_pos)
 
+		# Mirror indicator
+		if self.mirror_vertically:
+			mirror_text = font.render("MIRRORED", True, self.white)
+			if self.rotate_90_degrees:
+				mirror_pos = (20, self.display_height - 180)
+			else:
+				mirror_pos = (20, 140)
+			self.screen.blit(mirror_text, mirror_pos)
+
 	def handle_events(self):
 		"""Handle pygame events"""
 		for event in pygame.event.get():
@@ -343,6 +476,10 @@ class FaceShoulderApp:
 					else:
 						self.display_width = self.fullhd_width
 						self.display_height = self.fullhd_height
+				elif event.key == pygame.K_m:
+					# Toggle vertical mirroring
+					self.mirror_vertically = not self.mirror_vertically
+					print(f"Mirror: {'enabled' if self.mirror_vertically else 'disabled'}")
 
 		return True
 
@@ -352,8 +489,9 @@ class FaceShoulderApp:
 
 		print("Controls:")
 		print("- ESC: Exit")
-		print("- 'd': Toggle debug mode")
+		print("- 'd': Toggle debug mode (show pose keypoints and connections)")
 		print("- 'r': Toggle 90° rotation for vertical TV")
+		print("- 'm': Toggle vertical mirroring")
 		print(f"IMX500 status: {'Available' if self.imx500 else 'Not available'}")
 		print(f"Target: Face and shoulders detection at {self.display_width}x{self.display_height}")
 
