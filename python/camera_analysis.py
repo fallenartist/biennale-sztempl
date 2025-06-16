@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Face Analysis App - TV Landscape Mode
-- Camera feed fills entire TV screen (1920x1080)
-- Two-color threshold processing (white/black)
-- Multi-resolution grid analysis based on face detection
-- Live analysis areas preparation for further processing
+Face Analysis App - TV Landscape Mode - FIXED VERSION
+- Video feed and pose estimation properly aligned
+- Fixed rotation and cropping issues
+- Consistent coordinate transformations
 """
 
 import numpy as np
@@ -72,6 +71,13 @@ class FaceAnalysisApp:
 		self.fps_update_interval = 30
 		self.frame_count = 0
 		self.current_fps = 0.0
+
+		# DEBUG: Orientation testing flags
+		self.video_rotate_90 = True      # Whether to rotate video 90° (KEEP TRUE - correct orientation)
+		self.video_flip_h = True         # Whether to flip video horizontally (KEEP TRUE - correct)
+		self.crop_aspect_rotated = False # Whether crop uses rotated screen aspect ratio
+		self.pose_rotate_90 = False      # Whether to rotate pose points 90°
+		self.pose_flip_h = True          # Whether to flip pose points horizontally
 
 		# ================================================
 		# INITIALIZATION
@@ -210,7 +216,7 @@ class FaceAnalysisApp:
 			self.face_center = None
 
 	def _update_face_center(self):
-		"""Calculate face center in TV coordinates for grid analysis"""
+		"""Calculate face center in analysis coordinates - FIXED for analysis area scaling"""
 		if not self.pose_detected or self.last_keypoints is None or len(self.last_scores) == 0:
 			self.face_center = None
 			return
@@ -241,53 +247,35 @@ class FaceAnalysisApp:
 				face_x = sum(p[0] for p in valid_face_points) / len(valid_face_points)
 				face_y = sum(p[1] for p in valid_face_points) / len(valid_face_points)
 
-				# Convert to display coordinates - SAME TRANSFORMATIONS AS VIDEO
+				# FIXED: Transform to analysis coordinates (not screen coordinates)
 				crop_region = self.current_frame_crop_region
+
 				if crop_region:
 					crop_x, crop_y, crop_w, crop_h = crop_region
+
+					# Convert to relative coordinates within crop
 					relative_x = (face_x - crop_x) / crop_w
 					relative_y = (face_y - crop_y) / crop_h
 
-					# Scale to TV display size (landscape: 1920x1080)
-					tv_x = relative_x * self.display_width
-					tv_y = relative_y * self.display_height
-
-					# Apply mirroring (horizontal flip)
-					tv_x = self.display_width - tv_x
-
-					# Apply 90° rotation: (x,y) -> (y, width-x)
-					rotated_x = tv_y
-					rotated_y = self.display_width - tv_x
-
-					# Convert to analysis area coordinates (subtract margins)
-					analysis_x = rotated_x - self.margin_left
-					analysis_y = rotated_y - self.margin_top
-
-					# Ensure within analysis area bounds
-					if 0 <= analysis_x <= self.analysis_width and 0 <= analysis_y <= self.analysis_height:
-						self.face_center = (analysis_x, analysis_y)
-					else:
-						self.face_center = None
+					# Scale to analysis area size
+					analysis_x = relative_x * self.analysis_width
+					analysis_y = relative_y * self.analysis_height
 				else:
-					# No crop - scale directly from camera to display
-					tv_x = (face_x / self.camera_resolution[0]) * self.display_width
-					tv_y = (face_y / self.camera_resolution[1]) * self.display_height
+					# No crop, scale directly from camera to analysis area
+					analysis_x = (face_x / self.actual_camera_resolution[0]) * self.analysis_width
+					analysis_y = (face_y / self.actual_camera_resolution[1]) * self.analysis_height
 
-					# Apply mirroring
-					tv_x = self.display_width - tv_x
+				# Apply mirroring (horizontal flip)
+				analysis_x = self.analysis_width - analysis_x
 
-					# Apply rotation
-					rotated_x = tv_y
-					rotated_y = self.display_width - tv_x
+				# FIXED: For face center, we DON'T apply rotation since analysis grid is in pre-rotation coordinates
+				# Face center stays in analysis coordinates (before rotation)
 
-					# Convert to analysis coordinates
-					analysis_x = rotated_x - self.margin_left
-					analysis_y = rotated_y - self.margin_top
-
-					if 0 <= analysis_x <= self.analysis_width and 0 <= analysis_y <= self.analysis_height:
-						self.face_center = (analysis_x, analysis_y)
-					else:
-						self.face_center = None
+				# Ensure within analysis area bounds
+				if 0 <= analysis_x <= self.analysis_width and 0 <= analysis_y <= self.analysis_height:
+					self.face_center = (analysis_x, analysis_y)
+				else:
+					self.face_center = None
 			else:
 				self.face_center = None
 
@@ -295,8 +283,46 @@ class FaceAnalysisApp:
 			print(f"Error calculating face center: {e}")
 			self.face_center = None
 
+	def _transform_camera_to_final_coords(self, kp_x, kp_y):
+		"""Transform camera coordinates to final screen coordinates - FIXED for analysis area"""
+		# Use the same transformations as the video display
+		crop_region = self.current_frame_crop_region
+
+		if crop_region:
+			crop_x, crop_y, crop_w, crop_h = crop_region
+
+			# Convert to relative coordinates within crop
+			relative_x = (kp_x - crop_x) / crop_w
+			relative_y = (kp_y - crop_y) / crop_h
+
+			# FIXED: Scale to ANALYSIS AREA SIZE, not full display
+			analysis_x = relative_x * self.analysis_width
+			analysis_y = relative_y * self.analysis_height
+		else:
+			# No crop, scale directly from camera to analysis area
+			analysis_x = (kp_x / self.actual_camera_resolution[0]) * self.analysis_width
+			analysis_y = (kp_y / self.actual_camera_resolution[1]) * self.analysis_height
+
+		# Apply mirroring (horizontal flip)
+		analysis_x = self.analysis_width - analysis_x
+
+		# FIXED: Apply 90° rotation and add margins
+		# After rotation: (x,y) -> (y, width-x)
+		rotated_x = analysis_y
+		rotated_y = self.analysis_width - analysis_x
+
+		# Add margins to get final screen coordinates
+		final_x = rotated_x + self.margin_left
+		final_y = rotated_y + self.margin_top
+
+		# Clamp to screen bounds
+		final_x = max(0, min(self.display_width - 1, final_x))
+		final_y = max(0, min(self.display_height - 1, final_y))
+
+		return final_x, final_y
+
 	def _calculate_face_shoulder_crop_region(self):
-		"""Calculate crop region focusing on face and shoulders"""
+		"""Calculate crop region focusing on face and shoulders - DEBUG VERSION"""
 		if not self.pose_detected or self.last_keypoints is None or len(self.last_scores) == 0:
 			return None
 
@@ -339,32 +365,40 @@ class FaceAnalysisApp:
 
 			crop_x = max(0, min_x - padding_x)
 			crop_y = max(0, min_y - padding_y)
-			crop_w = min(self.camera_resolution[0] - crop_x, width + 2 * padding_x)
-			crop_h = min(self.camera_resolution[1] - crop_y, height + 2 * padding_y)
+			crop_w = min(self.actual_camera_resolution[0] - crop_x, width + 2 * padding_x)
+			crop_h = min(self.actual_camera_resolution[1] - crop_y, height + 2 * padding_y)
 
-			# Maintain aspect ratio
-			display_aspect = self.display_width / self.display_height
+			# DEBUG: Choose aspect ratio based on crop rotation setting
+			if self.crop_aspect_rotated:
+				# Use rotated aspect ratio (height/width) for final display after video rotation
+				target_aspect = self.analysis_height / self.analysis_width
+			else:
+				# Use normal aspect ratio (width/height)
+				target_aspect = self.analysis_width / self.analysis_height
+
 			crop_aspect = crop_w / crop_h
 
-			if crop_aspect > display_aspect:
-				new_crop_h = crop_w / display_aspect
+			if crop_aspect > target_aspect:
+				# Crop is wider than needed, adjust height
+				new_crop_h = crop_w / target_aspect
 				height_diff = new_crop_h - crop_h
 				crop_y = max(0, crop_y - height_diff / 2)
-				crop_h = min(self.camera_resolution[1] - crop_y, new_crop_h)
-				if crop_y + crop_h > self.camera_resolution[1]:
-					crop_h = self.camera_resolution[1] - crop_y
-					crop_w = crop_h * display_aspect
-					width_diff = (min(self.camera_resolution[0] - crop_x, crop_w) - crop_w) / 2
+				crop_h = min(self.actual_camera_resolution[1] - crop_y, new_crop_h)
+				if crop_y + crop_h > self.actual_camera_resolution[1]:
+					crop_h = self.actual_camera_resolution[1] - crop_y
+					crop_w = crop_h * target_aspect
+					width_diff = (min(self.actual_camera_resolution[0] - crop_x, crop_w) - crop_w) / 2
 					crop_x = max(0, crop_x + width_diff)
 			else:
-				new_crop_w = crop_h * display_aspect
+				# Crop is taller than needed, adjust width
+				new_crop_w = crop_h * target_aspect
 				width_diff = new_crop_w - crop_w
 				crop_x = max(0, crop_x - width_diff / 2)
-				crop_w = min(self.camera_resolution[0] - crop_x, new_crop_w)
-				if crop_x + crop_w > self.camera_resolution[0]:
-					crop_w = self.camera_resolution[0] - crop_x
-					crop_h = crop_w / display_aspect
-					height_diff = (min(self.camera_resolution[1] - crop_y, crop_h) - crop_h) / 2
+				crop_w = min(self.actual_camera_resolution[0] - crop_x, new_crop_w)
+				if crop_x + crop_w > self.actual_camera_resolution[0]:
+					crop_w = self.actual_camera_resolution[0] - crop_x
+					crop_h = crop_w / target_aspect
+					height_diff = (min(self.actual_camera_resolution[1] - crop_y, crop_h) - crop_h) / 2
 					crop_y = max(0, crop_y + height_diff)
 
 			return (int(crop_x), int(crop_y), int(crop_w), int(crop_h))
@@ -374,14 +408,10 @@ class FaceAnalysisApp:
 			return None
 
 	def generate_analysis_grid(self):
-		"""Generate adaptive grid with proper 2x2 nesting - TV landscape coordinates"""
+		"""Generate adaptive grid with mixed nesting - more organic/random appearance"""
 		self.analysis_areas = []
 
-		# PROPER NESTING: Each larger grid contains exactly 2x2 smaller grids
-		# face_grid_size = 38px -> 2x2 = 76px (shoulder_grid_size)
-		# shoulder_grid_size = 76px -> 2x2 = 152px (background_grid_size)
-
-		# Start with the largest grid (152x152) and subdivide as needed
+		# Start with the largest grid (152x152) and subdivide with variety
 		large_step = self.background_grid_size  # 152px
 
 		y = 0
@@ -414,58 +444,123 @@ class FaceAnalysisApp:
 						self.analysis_areas.append(area_info)
 
 				elif grid_type == 'shoulder':
-					# Split into 2x2 medium areas (76x76)
+					# MIXED: Some medium areas, some medium split into small
 					medium_step = self.shoulder_grid_size  # 76px
+					small_step = self.face_grid_size      # 38px
+
 					for dy in range(0, large_step, medium_step):
 						for dx in range(0, large_step, medium_step):
 							sub_x = x + dx
 							sub_y = y + dy
 
 							if sub_x < self.analysis_width and sub_y < self.analysis_height:
-								actual_width = min(medium_step, self.analysis_width - sub_x)
-								actual_height = min(medium_step, self.analysis_height - sub_y)
+								# Randomly decide: keep as medium or split to small
+								# More likely to stay medium in shoulder areas
+								split_to_small = (col_count + row_count + dx//medium_step + dy//medium_step) % 3 == 0
 
-								if actual_width > 0 and actual_height > 0:
-									area_info = {
-										'x': sub_x + self.margin_left,
-										'y': sub_y + self.margin_top,
-										'width': actual_width,
-										'height': actual_height,
-										'grid_size': medium_step,
-										'analysis_x': sub_x,
-										'analysis_y': sub_y,
-										'row': row_count,
-										'col': col_count,
-										'type': 'shoulder'
-									}
-									self.analysis_areas.append(area_info)
+								if split_to_small:
+									# Split this 76x76 into 4 small 38x38 areas
+									for sdy in range(0, medium_step, small_step):
+										for sdx in range(0, medium_step, small_step):
+											ssub_x = sub_x + sdx
+											ssub_y = sub_y + sdy
+
+											if ssub_x < self.analysis_width and ssub_y < self.analysis_height:
+												actual_width = min(small_step, self.analysis_width - ssub_x)
+												actual_height = min(small_step, self.analysis_height - ssub_y)
+
+												if actual_width > 0 and actual_height > 0:
+													area_info = {
+														'x': ssub_x + self.margin_left,
+														'y': ssub_y + self.margin_top,
+														'width': actual_width,
+														'height': actual_height,
+														'grid_size': small_step,
+														'analysis_x': ssub_x,
+														'analysis_y': ssub_y,
+														'row': row_count,
+														'col': col_count,
+														'type': 'face'  # Small areas in shoulder zone
+													}
+													self.analysis_areas.append(area_info)
+								else:
+									# Keep as medium 76x76 area
+									actual_width = min(medium_step, self.analysis_width - sub_x)
+									actual_height = min(medium_step, self.analysis_height - sub_y)
+
+									if actual_width > 0 and actual_height > 0:
+										area_info = {
+											'x': sub_x + self.margin_left,
+											'y': sub_y + self.margin_top,
+											'width': actual_width,
+											'height': actual_height,
+											'grid_size': medium_step,
+											'analysis_x': sub_x,
+											'analysis_y': sub_y,
+											'row': row_count,
+											'col': col_count,
+											'type': 'shoulder'
+										}
+										self.analysis_areas.append(area_info)
 
 				elif grid_type == 'face':
-					# Split into 4x4 small areas (38x38) within the 152x152
-					small_step = self.face_grid_size  # 38px
-					for dy in range(0, large_step, small_step):
-						for dx in range(0, large_step, small_step):
+					# MIXED: Some medium areas, mostly small areas
+					medium_step = self.shoulder_grid_size  # 76px
+					small_step = self.face_grid_size      # 38px
+
+					for dy in range(0, large_step, medium_step):
+						for dx in range(0, large_step, medium_step):
 							sub_x = x + dx
 							sub_y = y + dy
 
 							if sub_x < self.analysis_width and sub_y < self.analysis_height:
-								actual_width = min(small_step, self.analysis_width - sub_x)
-								actual_height = min(small_step, self.analysis_height - sub_y)
+								# Mostly split to small, but occasionally keep medium
+								keep_as_medium = (col_count + row_count + dx//medium_step + dy//medium_step) % 5 == 0
 
-								if actual_width > 0 and actual_height > 0:
-									area_info = {
-										'x': sub_x + self.margin_left,
-										'y': sub_y + self.margin_top,
-										'width': actual_width,
-										'height': actual_height,
-										'grid_size': small_step,
-										'analysis_x': sub_x,
-										'analysis_y': sub_y,
-										'row': row_count,
-										'col': col_count,
-										'type': 'face'
-									}
-									self.analysis_areas.append(area_info)
+								if keep_as_medium:
+									# Keep as medium 76x76 area occasionally
+									actual_width = min(medium_step, self.analysis_width - sub_x)
+									actual_height = min(medium_step, self.analysis_height - sub_y)
+
+									if actual_width > 0 and actual_height > 0:
+										area_info = {
+											'x': sub_x + self.margin_left,
+											'y': sub_y + self.margin_top,
+											'width': actual_width,
+											'height': actual_height,
+											'grid_size': medium_step,
+											'analysis_x': sub_x,
+											'analysis_y': sub_y,
+											'row': row_count,
+											'col': col_count,
+											'type': 'shoulder'  # Medium areas in face zone
+										}
+										self.analysis_areas.append(area_info)
+								else:
+									# Split this 76x76 into 4 small 38x38 areas (most common)
+									for sdy in range(0, medium_step, small_step):
+										for sdx in range(0, medium_step, small_step):
+											ssub_x = sub_x + sdx
+											ssub_y = sub_y + sdy
+
+											if ssub_x < self.analysis_width and ssub_y < self.analysis_height:
+												actual_width = min(small_step, self.analysis_width - ssub_x)
+												actual_height = min(small_step, self.analysis_height - ssub_y)
+
+												if actual_width > 0 and actual_height > 0:
+													area_info = {
+														'x': ssub_x + self.margin_left,
+														'y': ssub_y + self.margin_top,
+														'width': actual_width,
+														'height': actual_height,
+														'grid_size': small_step,
+														'analysis_x': ssub_x,
+														'analysis_y': ssub_y,
+														'row': row_count,
+														'col': col_count,
+														'type': 'face'
+													}
+													self.analysis_areas.append(area_info)
 
 				x += large_step
 				col_count += 1
@@ -484,8 +579,13 @@ class FaceAnalysisApp:
 				face_areas = len([a for a in self.analysis_areas if a['type'] == 'face'])
 				shoulder_areas = len([a for a in self.analysis_areas if a['type'] == 'shoulder'])
 				background_areas = len([a for a in self.analysis_areas if a['type'] == 'background'])
-				print(f"DEBUG: Area types - Face: {face_areas}, Shoulder: {shoulder_areas}, Background: {background_areas}")
-				print(f"DEBUG: Nesting check - 38px areas: {face_areas}, 76px areas: {shoulder_areas}, 152px areas: {background_areas}")
+				print(f"DEBUG: Mixed grid - Face: {face_areas}, Shoulder: {shoulder_areas}, Background: {background_areas}")
+
+				# Show size distribution
+				size_38 = len([a for a in self.analysis_areas if a['grid_size'] == 38])
+				size_76 = len([a for a in self.analysis_areas if a['grid_size'] == 76])
+				size_152 = len([a for a in self.analysis_areas if a['grid_size'] == 152])
+				print(f"DEBUG: Size distribution - 38px: {size_38}, 76px: {size_76}, 152px: {size_152}")
 
 	def _get_grid_type_for_area(self, x, y, area_size):
 		"""Determine grid type for a large area based on face center"""
@@ -542,7 +642,7 @@ class FaceAnalysisApp:
 			return surface
 
 	def draw_video_display(self):
-		"""Draw the main video display - ROTATED for physically rotated TV"""
+		"""Draw the main video display - FIXED: Video fills analysis area properly"""
 		self.update_fps()
 		self.screen.fill(self.black)
 
@@ -560,33 +660,36 @@ class FaceAnalysisApp:
 			frame_rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
 			frame_surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
 
-			# Crop to face/shoulders if detected
+			# FIXED: Crop and scale to fill the ENTIRE ANALYSIS AREA
 			crop_region = self.current_frame_crop_region
 			if crop_region and self.pose_detected:
 				crop_x, crop_y, crop_w, crop_h = crop_region
 				if crop_w > 0 and crop_h > 0:
 					cropped_surface = pygame.Surface((crop_w, crop_h))
 					cropped_surface.blit(frame_surface, (0, 0), (crop_x, crop_y, crop_w, crop_h))
-					# Scale cropped area to FILL ENTIRE TV DISPLAY
-					display_surface = pygame.transform.scale(cropped_surface, (self.display_width, self.display_height))
+					# Scale cropped area to fill analysis area
+					display_surface = pygame.transform.scale(cropped_surface, (self.analysis_width, self.analysis_height))
 				else:
-					# Scale full frame to FILL ENTIRE TV DISPLAY
-					display_surface = pygame.transform.scale(frame_surface, (self.display_width, self.display_height))
+					# Scale full frame to fill analysis area
+					display_surface = pygame.transform.scale(frame_surface, (self.analysis_width, self.analysis_height))
 			else:
-				# No crop, scale full frame to FILL ENTIRE TV DISPLAY
-				display_surface = pygame.transform.scale(frame_surface, (self.display_width, self.display_height))
+				# No crop, scale full frame to fill analysis area
+				display_surface = pygame.transform.scale(frame_surface, (self.analysis_width, self.analysis_height))
 
-			# Apply mirroring (horizontal flip)
-			display_surface = pygame.transform.flip(display_surface, True, False)
+			# DEBUG: Apply horizontal flip if enabled
+			if self.video_flip_h:
+				display_surface = pygame.transform.flip(display_surface, True, False)
 
-			# ROTATE 90° for physically rotated TV
-			display_surface = pygame.transform.rotate(display_surface, 90)
+			# DEBUG: Apply rotation if enabled
+			if self.video_rotate_90:
+				display_surface = pygame.transform.rotate(display_surface, 90)
 
 			# Apply two-color threshold effect
 			display_surface = self.apply_threshold_effect(display_surface)
 
-			# Draw video to FILL ENTIRE SCREEN
-			self.screen.blit(display_surface, (0, 0))
+			# FIXED: Draw video positioned to fill analysis area
+			# After rotation: width/height are swapped, so it's analysis_height x analysis_width
+			self.screen.blit(display_surface, (self.margin_left, self.margin_top))
 
 			# Generate and draw analysis grid (in TV coordinates)
 			self.generate_analysis_grid()
@@ -649,7 +752,7 @@ class FaceAnalysisApp:
 			pygame.draw.rect(self.screen, (255, 0, 255), (0, self.display_height - self.margin_bottom, self.display_width, self.margin_bottom), 1)
 
 	def draw_pose_debug_overlay(self):
-		"""Draw pose keypoints and connections for debugging"""
+		"""Draw pose keypoints and connections for debugging - FIXED coordinate transformation"""
 		if not self.pose_detected or self.last_keypoints is None or len(self.last_scores) == 0:
 			return
 
@@ -662,7 +765,7 @@ class FaceAnalysisApp:
 			if len(person_keypoints) < 17:
 				return
 
-			# Convert keypoints to display coordinates - SAME TRANSFORMATIONS AS VIDEO
+			# Convert keypoints to final screen coordinates using the SAME transformation pipeline
 			screen_points = {}
 			target_indices = [0, 1, 2, 3, 4, 5, 6]  # Face + shoulders
 
@@ -670,35 +773,8 @@ class FaceAnalysisApp:
 				if idx < len(person_keypoints):
 					kp_x, kp_y, visibility = person_keypoints[idx]
 					if visibility > self.visibility_threshold:
-						# Convert using SAME TRANSFORMATIONS AS VIDEO
-						crop_region = self.current_frame_crop_region
-						if crop_region:
-							crop_x, crop_y, crop_w, crop_h = crop_region
-							relative_x = (kp_x - crop_x) / crop_w
-							relative_y = (kp_y - crop_y) / crop_h
-
-							# Scale to TV display size
-							tv_x = relative_x * self.display_width
-							tv_y = relative_y * self.display_height
-
-							# Apply mirroring
-							tv_x = self.display_width - tv_x
-
-							# Apply 90° rotation: (x,y) -> (y, width-x)
-							final_x = tv_y
-							final_y = self.display_width - tv_x
-						else:
-							# Fallback without crop
-							tv_x = (kp_x / self.camera_resolution[0]) * self.display_width
-							tv_y = (kp_y / self.camera_resolution[1]) * self.display_height
-							tv_x = self.display_width - tv_x
-							final_x = tv_y
-							final_y = self.display_width - tv_x
-
-						# Clamp to bounds
-						final_x = max(0, min(self.display_width - 1, final_x))
-						final_y = max(0, min(self.display_height - 1, final_y))
-
+						# FIXED: Use the same transformation pipeline as video
+						final_x, final_y = self._transform_camera_to_final_coords(kp_x, kp_y)
 						screen_points[idx] = (int(final_x), int(final_y))
 
 			# Draw connections
@@ -720,10 +796,13 @@ class FaceAnalysisApp:
 				color = self.red if idx == 0 else self.white if idx <= 4 else self.green
 				pygame.draw.circle(self.screen, color, screen_points[idx], 6)
 
-			# Draw face center if available (convert to final screen coordinates)
+			# FIXED: Draw face center in correct coordinates
 			if self.face_center:
+				# Face center is in analysis coordinates, convert to screen coordinates
 				face_screen_x = self.face_center[0] + self.margin_left
 				face_screen_y = self.face_center[1] + self.margin_top
+
+				# Draw a yellow circle to mark face center
 				pygame.draw.circle(self.screen, (255, 255, 0),
 								 (int(face_screen_x), int(face_screen_y)), 10, 2)
 
@@ -760,10 +839,19 @@ class FaceAnalysisApp:
 		threshold_text = f"Threshold: {self.threshold_value}"
 		threshold_surface = font.render(threshold_text, True, self.green)
 
+		# Crop region info
+		if self.current_frame_crop_region:
+			crop_x, crop_y, crop_w, crop_h = self.current_frame_crop_region
+			crop_text = f"Crop: {crop_w}x{crop_h}"
+		else:
+			crop_text = "Crop: Full frame"
+		crop_surface = font.render(crop_text, True, self.green)
+
 		# ROTATE text 90° for physically rotated TV
 		fps_surface = pygame.transform.rotate(fps_surface, 90)
 		stats_surface = pygame.transform.rotate(stats_surface, 90)
 		threshold_surface = pygame.transform.rotate(threshold_surface, 90)
+		crop_surface = pygame.transform.rotate(crop_surface, 90)
 
 		# Position for rotated TV - right side becomes bottom when TV is rotated
 		base_x = self.display_width - 100  # Right side of landscape TV
@@ -771,6 +859,7 @@ class FaceAnalysisApp:
 		self.screen.blit(fps_surface, (base_x, 20))
 		self.screen.blit(stats_surface, (base_x - 60, 20))
 		self.screen.blit(threshold_surface, (base_x - 120, 20))
+		self.screen.blit(crop_surface, (base_x - 180, 20))
 
 		# Debug coordinate info
 		if self.frame_count % 60 == 0:
@@ -809,6 +898,36 @@ class FaceAnalysisApp:
 					# Adjust threshold value
 					self.threshold_value = (self.threshold_value + 32) % 256
 					print(f"Threshold value: {self.threshold_value}")
+				# DEBUG KEYS FOR ORIENTATION TESTING
+				elif event.key == pygame.K_1:
+					# Video rotation should stay True - this is just for testing
+					self.video_rotate_90 = not self.video_rotate_90
+					print(f"Video rotate 90°: {self.video_rotate_90} (should stay True)")
+				elif event.key == pygame.K_2:
+					# Video flip should stay True - this is just for testing
+					self.video_flip_h = not self.video_flip_h
+					print(f"Video flip horizontal: {self.video_flip_h} (should stay True)")
+				elif event.key == pygame.K_3:
+					# Toggle crop aspect ratio calculation
+					self.crop_aspect_rotated = not self.crop_aspect_rotated
+					print(f"Crop uses rotated aspect ratio: {self.crop_aspect_rotated}")
+				elif event.key == pygame.K_4:
+					# Toggle pose rotation
+					self.pose_rotate_90 = not self.pose_rotate_90
+					print(f"Pose rotate 90°: {self.pose_rotate_90}")
+				elif event.key == pygame.K_5:
+					# Toggle pose horizontal flip
+					self.pose_flip_h = not self.pose_flip_h
+					print(f"Pose flip horizontal: {self.pose_flip_h}")
+				elif event.key == pygame.K_0:
+					# Log current combination
+					print(f"\n=== CURRENT ORIENTATION COMBINATION ===")
+					print(f"Video rotate 90°: {self.video_rotate_90}")
+					print(f"Video flip horizontal: {self.video_flip_h}")
+					print(f"Crop uses rotated aspect: {self.crop_aspect_rotated}")
+					print(f"Pose rotate 90°: {self.pose_rotate_90}")
+					print(f"Pose flip horizontal: {self.pose_flip_h}")
+					print(f"=======================================\n")
 
 		return True
 
@@ -820,6 +939,14 @@ class FaceAnalysisApp:
 		print("- ESC: Exit")
 		print("- 'd': Toggle debug mode (pose keypoints + FPS)")
 		print("- 't': Adjust threshold value for two-color effect")
+		print("=== DEBUG ORIENTATION CONTROLS ===")
+		print("- '1': Toggle video rotation (keep True)")
+		print("- '2': Toggle video flip (keep True)")
+		print("- '3': Toggle crop aspect ratio calculation")
+		print("- '4': Toggle pose rotation 90°")
+		print("- '5': Toggle pose horizontal flip")
+		print("- '0': Log current combination")
+		print("===================================")
 		print(f"TV Display: {self.display_width}x{self.display_height} (landscape)")
 		print(f"Analysis grid: {self.analysis_width}x{self.analysis_height} with adaptive sizing")
 		print(f"TV coordinates: 0,0 to {self.display_width},{self.display_height}")
@@ -828,6 +955,15 @@ class FaceAnalysisApp:
 		# Force debug mode on initially
 		self.debug_mode = True
 		print("DEBUG MODE ENABLED BY DEFAULT")
+
+		# Show initial orientation settings
+		print(f"\n=== INITIAL ORIENTATION SETTINGS ===")
+		print(f"Video rotate 90°: {self.video_rotate_90}")
+		print(f"Video flip horizontal: {self.video_flip_h}")
+		print(f"Crop uses rotated aspect: {self.crop_aspect_rotated}")
+		print(f"Pose rotate 90°: {self.pose_rotate_90}")
+		print(f"Pose flip horizontal: {self.pose_flip_h}")
+		print(f"====================================\n")
 
 		while running:
 			running = self.handle_events()
