@@ -87,7 +87,18 @@ class FaceShoulderApp:
 
 		# Tiles - Using larger tile sizes
 		tiles_dir = os.path.join(os.path.dirname(__file__), "tiles")
-		self.tile_filter = TileFilter(tiles_dir, cell_sizes=[40, 80, 120])  # Larger tiles
+		self.tile_filter = TileFilter(
+			tiles_dir,
+			cell_sizes=[40, 80, 120],
+			enable_rotation=True,
+			enable_noise_random_rotation=True,
+			noise_rotation_interval=60,
+			enable_filter_random_rotation=True,
+			filter_rotation_interval=60
+		)
+
+		self.tile_filter.set_noise_size_distribution({40: 6, 80: 3, 120: 1})
+		self.tile_filter.set_filter_size_distribution({40: 7, 80: 2, 120: 1})
 
 		print(f"Display: {self.display_width}x{self.display_height}, "
 			  f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
