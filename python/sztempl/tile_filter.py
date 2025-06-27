@@ -102,7 +102,8 @@ class TileFilter:
 				 enable_noise_random_rotation=False,
 				 noise_rotation_interval=60,
 				 enable_filter_random_rotation=False,
-				 filter_rotation_interval=45):
+				 filter_rotation_interval=45,
+				 eye_tile=False):
 		"""
 		tiles_dir: path to directory containing tiles named '000.png', '012.png', etc.
 		cell_sizes: list of ints, e.g. [40, 80, 120] for small/medium/large tiles.
@@ -112,6 +113,7 @@ class TileFilter:
 		noise_rotation_interval: int, frames between random rotation updates in noise mode
 		enable_filter_random_rotation: bool, whether to randomly re-rotate tiles in filter mode
 		filter_rotation_interval: int, frames between random rotation updates in filter mode
+		eye_tile: bool, whether to replace tiles at eye/nose/ear positions with special eye.png
 		"""
 		self.cell_sizes = sorted(cell_sizes)
 		self.enable_rotation = enable_rotation
@@ -120,10 +122,16 @@ class TileFilter:
 		self.enable_filter_random_rotation = enable_filter_random_rotation
 		self.filter_rotation_interval = filter_rotation_interval
 		self.tiles_dir = tiles_dir
+		self.eye_tile = eye_tile
 
 		# Store size distributions for both modes
 		self.noise_size_distribution = noise_size_distribution
 		self.filter_size_distribution = None  # Can be set later
+
+		# Eye tile settings
+		self.eye_image = None
+		self.eye_tile_size = None  # Will be set to medium size
+		self.face_keypoints = None  # Store current face keypoints (nose, eyes, ears)
 
 		# Create weighted lists for size selection
 		self._update_size_choices()
@@ -133,6 +141,10 @@ class TileFilter:
 
 		# discover and sort tile files by their filename brightness
 		self._discover_tile_files()
+
+		# Load special eye tile if enabled
+		if self.eye_tile:
+			self._load_eye_tile()
 
 		self.images = None  # will load once display is ready
 
@@ -206,6 +218,22 @@ class TileFilter:
 
 		print("Cleared caches on startup")
 
+	def _load_eye_tile(self):
+		"""Load the special eye.png tile"""
+		eye_path = os.path.join(self.tiles_dir, "eye.png")
+		if os.path.exists(eye_path):
+			print(f"Found eye tile: {eye_path}")
+			# Set eye tile size to medium (middle of cell_sizes)
+			if len(self.cell_sizes) >= 2:
+				self.eye_tile_size = self.cell_sizes[1]  # Medium size
+			else:
+				self.eye_tile_size = self.cell_sizes[0]  # Fallback to available size
+			print(f"Eye tile size set to: {self.eye_tile_size}px")
+		else:
+			print(f"WARNING: eye.png not found at {eye_path}")
+			print("Eye tile feature disabled")
+			self.eye_tile = False
+
 	def _discover_tile_files(self):
 		"""Discover and catalog tile files"""
 		paths = glob.glob(os.path.join(self.tiles_dir, "*.png"))
@@ -257,7 +285,136 @@ class TileFilter:
 				fallback.fill((128, 128, 128))
 				self.images.append(fallback)
 
+		# Load eye image if enabled
+		if self.eye_tile and self.eye_image is None:
+			try:
+				eye_path = os.path.join(self.tiles_dir, "eye.png")
+				self.eye_image = pygame.image.load(eye_path).convert_alpha()
+				print(f"  Loaded eye tile: eye.png")
+			except Exception as e:
+				print(f"  ERROR loading eye.png: {e}")
+				self.eye_tile = False
+
 		print(f"Successfully loaded {len(self.images)} tile images")
+
+	def set_face_keypoints(self, keypoints, camera_resolution=None, crop_region=None, display_size=None, mirror=False, rotate_90=False):
+		"""Set the current face keypoints for eye tile positioning"""
+		self.face_keypoints = keypoints
+		self.camera_resolution = camera_resolution
+		self.crop_region = crop_region
+		self.display_size = display_size
+		self.mirror = mirror
+		self.rotate_90 = rotate_90
+
+	def _transform_keypoint_to_screen(self, x, y):
+		"""Transform a keypoint through the same pipeline as the video frame"""
+		if not hasattr(self, 'camera_resolution') or not self.camera_resolution:
+			return None, None
+
+		# Start with original camera coordinates
+		current_x, current_y = x, y
+
+		# Step 1: Apply face/shoulder crop if available
+		if hasattr(self, 'crop_region') and self.crop_region:
+			crop_x, crop_y, crop_w, crop_h = self.crop_region
+
+			# Check if keypoint is within crop region
+			if not (crop_x <= current_x < crop_x + crop_w and crop_y <= current_y < crop_y + crop_h):
+				return None, None  # Keypoint is outside crop region
+
+			# Transform to crop coordinates
+			current_x = current_x - crop_x
+			current_y = current_y - crop_y
+
+			# Scale to display size
+			if hasattr(self, 'display_size') and self.display_size:
+				display_w, display_h = self.display_size
+				current_x = current_x * display_w / crop_w
+				current_y = current_y * display_h / crop_h
+		else:
+			# No crop - scale from camera to display size directly
+			if hasattr(self, 'display_size') and self.display_size:
+				display_w, display_h = self.display_size
+				cam_w, cam_h = self.camera_resolution
+				current_x = current_x * display_w / cam_w
+				current_y = current_y * display_h / cam_h
+
+		# Step 2: Apply mirror transformation
+		if hasattr(self, 'mirror') and self.mirror and hasattr(self, 'display_size'):
+			display_w, display_h = self.display_size
+			current_x = display_w - current_x
+
+		# Step 3: Apply 90-degree rotation
+		if hasattr(self, 'rotate_90') and self.rotate_90 and hasattr(self, 'display_size'):
+			display_w, display_h = self.display_size
+			# 90-degree clockwise rotation: (x,y) -> (y, display_w - x)
+			new_x = current_y
+			new_y = display_w - current_x
+			current_x, current_y = new_x, new_y
+
+		return int(current_x), int(current_y)
+
+	def _get_eye_positions(self, screen_w, screen_h):
+		"""Get screen positions for ONLY the two eyes"""
+		if self.face_keypoints is None or not self.eye_tile:
+			return []
+
+		positions = []
+		# COCO keypoint indices: 1=left_eye, 2=right_eye (ONLY THESE TWO)
+		eye_indices = [1, 2]  # Only actual eyes, not nose/ears
+
+		print(f"DEBUG: Processing eye keypoints with transformations")
+
+		for idx in eye_indices:
+			if idx < len(self.face_keypoints):
+				x, y, visibility = self.face_keypoints[idx]
+				eye_name = "left_eye" if idx == 1 else "right_eye"
+				print(f"DEBUG: {eye_name} (kp{idx}): original x={x}, y={y}, vis={visibility}")
+
+				if visibility > 0.3:  # Threshold for visibility
+					# Transform keypoint through the same pipeline as video
+					screen_x, screen_y = self._transform_keypoint_to_screen(x, y)
+
+					if screen_x is not None and screen_y is not None:
+						# Clamp to screen bounds
+						screen_x = max(0, min(screen_x, screen_w - 1))
+						screen_y = max(0, min(screen_y, screen_h - 1))
+
+						positions.append((screen_x, screen_y))
+						print(f"DEBUG: {eye_name} transformed to screen coords ({screen_x}, {screen_y})")
+					else:
+						print(f"DEBUG: {eye_name} transformation failed (outside crop region)")
+
+		print(f"DEBUG: Found {len(positions)} transformed eye positions")
+		return positions
+
+	def _is_eye_position(self, tile_x, tile_y, tile_size, screen_w, screen_h):
+		"""Check if a tile position should be replaced with eye tile"""
+		if not self.eye_tile or self.face_keypoints is None:
+			return False
+
+		eye_positions = self._get_eye_positions(screen_w, screen_h)
+
+		# Check if tile overlaps with any eye position
+		for eye_x, eye_y in eye_positions:
+			# Calculate tile bounds
+			tile_right = tile_x + tile_size
+			tile_bottom = tile_y + tile_size
+
+			# Debug: Check specific eye positions
+			if eye_x >= 980 and eye_x <= 1020 and eye_y >= 740 and eye_y <= 780:
+				print(f"DEBUG: Checking tile ({tile_x},{tile_y},{tile_size}) vs eye ({eye_x},{eye_y})")
+				print(f"DEBUG: Eye tile size is {self.eye_tile_size}, current tile size is {tile_size}")
+				print(f"DEBUG: Tile bounds: {tile_x}-{tile_right}, {tile_y}-{tile_bottom}")
+
+			# Check if eye position is within tile bounds
+			if (tile_x <= eye_x < tile_right and
+				tile_y <= eye_y < tile_bottom and
+				tile_size == self.eye_tile_size):  # Only replace medium-sized tiles
+				print(f"DEBUG: *** EYE TILE MATCH! *** Tile({tile_x},{tile_y},{tile_size}) contains eye({eye_x},{eye_y})")
+				return True
+
+		return False
 
 	def reload_images(self):
 		"""Force reload of all tile images (clears cache)"""
@@ -455,11 +612,18 @@ class TileFilter:
 								break
 
 					if should_draw and k < len(self.images):
-						# Draw tile with potential rotation
-						img = self.images[k]
-						rotation_key = f"noise_{i}_{j}_{step}_{k}"
-						img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=True)
-						screen.blit(img_s, (i, j))
+						# Check if this position should show eye tile
+						if self._is_eye_position(i, j, step, screen_w, screen_h):
+							# Draw eye tile instead
+							rotation_key = f"eye_noise_{i}_{j}_{step}"
+							img_s = self._get_rotated_tile(self.eye_image, step, rotation_key, is_noise_mode=True)
+							screen.blit(img_s, (i, j))
+						else:
+							# Draw normal tile with potential rotation
+							img = self.images[k]
+							rotation_key = f"noise_{i}_{j}_{step}_{k}"
+							img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=True)
+							screen.blit(img_s, (i, j))
 
 	def apply_tiles(self, screen, frame):
 		"""
@@ -535,11 +699,18 @@ class TileFilter:
 
 						# Bounds check
 						if idx < len(self.images):
-							# Draw tile with static rotation
-							img = self.images[idx]
-							rotation_key = f"detect_{i}_{j}_{step}_{idx}"
-							img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=False)
-							screen.blit(img_s, (i, j))
+							# Check if this position should show eye tile
+							if self._is_eye_position(i, j, step, screen_w, screen_h):
+								# Draw eye tile instead
+								rotation_key = f"eye_detect_{i}_{j}_{step}"
+								img_s = self._get_rotated_tile(self.eye_image, step, rotation_key, is_noise_mode=False)
+								screen.blit(img_s, (i, j))
+							else:
+								# Draw normal tile with static rotation
+								img = self.images[idx]
+								rotation_key = f"detect_{i}_{j}_{step}_{idx}"
+								img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=False)
+								screen.blit(img_s, (i, j))
 
 							# Mark this area and overlapping areas as filled
 							for dy in range(0, step, base_step):
@@ -570,10 +741,18 @@ class TileFilter:
 						idx = 0
 
 					if idx < len(self.images):
-						img = self.images[idx]
-						rotation_key = f"detect_fill_{i}_{j}_{idx}"
-						img_s = self._get_rotated_tile(img, base_step, rotation_key, is_noise_mode=False)
-						screen.blit(img_s, (i, j))
+						# Check if this position should show eye tile
+						if self._is_eye_position(i, j, base_step, screen_w, screen_h):
+							# Draw eye tile for gap fill
+							rotation_key = f"eye_fill_{i}_{j}"
+							img_s = self._get_rotated_tile(self.eye_image, base_step, rotation_key, is_noise_mode=False)
+							screen.blit(img_s, (i, j))
+						else:
+							# Draw normal gap-filling tile
+							img = self.images[idx]
+							rotation_key = f"detect_fill_{i}_{j}_{idx}"
+							img_s = self._get_rotated_tile(img, base_step, rotation_key, is_noise_mode=False)
+							screen.blit(img_s, (i, j))
 
 	def generate_new_pattern(self):
 		"""Public method to generate new pattern (like pressing a key in Processing)"""

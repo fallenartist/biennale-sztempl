@@ -95,7 +95,7 @@ class FaceShoulderApp:
 
 		self.clock = pygame.time.Clock()
 
-		# Tiles - Using larger tile sizes
+		# Tiles - Using larger tile sizes with eye tile feature
 		tiles_dir = os.path.join(os.path.dirname(__file__), "tiles")
 		self.tile_filter = TileFilter(
 			tiles_dir,
@@ -104,7 +104,8 @@ class FaceShoulderApp:
 			enable_noise_random_rotation=True,
 			noise_rotation_interval=60,
 			enable_filter_random_rotation=False,
-			filter_rotation_interval=45
+			filter_rotation_interval=45,
+			eye_tile=True  # Enable eye tile feature
 		)
 
 		# Configure tile distributions
@@ -384,6 +385,22 @@ class FaceShoulderApp:
 			# Person detected (stable) - get processed frame and apply tile mosaic
 			processed_frame = self.get_processed_frame_for_tiles()
 			if processed_frame is not None:
+				# Pass face keypoints to tile filter for eye tile positioning
+				if self.pose_detected and self.last_keypoints is not None and len(self.last_keypoints) > 0:
+					# Get the best person's keypoints (highest confidence)
+					best_person_idx = np.argmax(self.last_scores)
+					face_keypoints = self.last_keypoints[best_person_idx]
+
+					# Pass all transformation parameters so keypoints follow same pipeline as video
+					self.tile_filter.set_face_keypoints(
+						face_keypoints,
+						camera_resolution=self.camera_resolution,
+						crop_region=self.get_face_shoulder_crop_region(),
+						display_size=(self.display_width, self.display_height),
+						mirror=self.mirror_horizontally,
+						rotate_90=self.rotate_90_degrees
+					)
+
 				self.tile_filter.apply_tiles(self.screen, processed_frame)
 			else:
 				# Fallback to noise if processing fails
