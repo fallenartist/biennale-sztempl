@@ -133,6 +133,12 @@ class TileFilter:
 		self.eye_tile_size = None  # Will be set to medium size
 		self.face_keypoints = None  # Store current face keypoints (nose, eyes, ears)
 
+		# Eye tile smoothing - CONFIGURABLE VARIABLES
+		self.eye_stability_window = 8     # Frames to consider for eye stability
+		self.eye_visibility_threshold = 0.6  # 60% of recent frames must have eye visible
+		self.eye_detection_history = {}  # Track history per eye: {1: [True, False, True...], 2: [...]}
+		self.stable_eye_positions = {}   # Stable eye positions: {1: (x, y), 2: (x, y)}
+
 		# Create weighted lists for size selection
 		self._update_size_choices()
 
@@ -354,38 +360,71 @@ class TileFilter:
 
 		return int(current_x), int(current_y)
 
+	def _update_eye_stability(self, screen_w, screen_h):
+		"""Update stable eye positions based on recent detection history"""
+		if self.face_keypoints is None or not self.eye_tile:
+			return
+
+		eye_indices = [1, 2]  # left_eye, right_eye
+
+		for idx in eye_indices:
+			# Initialize history if needed
+			if idx not in self.eye_detection_history:
+				self.eye_detection_history[idx] = []
+
+			# Get current eye data
+			current_detected = False
+			current_position = None
+
+			if idx < len(self.face_keypoints):
+				x, y, visibility = self.face_keypoints[idx]
+				if visibility > 0.3:
+					# Transform to screen coordinates
+					screen_x, screen_y = self._transform_keypoint_to_screen(x, y)
+					if screen_x is not None and screen_y is not None:
+						screen_x = max(0, min(screen_x, screen_w - 1))
+						screen_y = max(0, min(screen_y, screen_h - 1))
+						current_detected = True
+						current_position = (screen_x, screen_y)
+
+			# Add to history
+			self.eye_detection_history[idx].append(current_detected)
+
+			# Keep only recent history
+			if len(self.eye_detection_history[idx]) > self.eye_stability_window:
+				self.eye_detection_history[idx].pop(0)
+
+			# Determine stable state
+			if len(self.eye_detection_history[idx]) >= self.eye_stability_window:
+				detection_ratio = sum(self.eye_detection_history[idx]) / len(self.eye_detection_history[idx])
+
+				if detection_ratio >= self.eye_visibility_threshold:
+					# Eye should be stable - update position if we have current data
+					if current_detected and current_position:
+						self.stable_eye_positions[idx] = current_position
+				else:
+					# Eye should not be visible - remove from stable positions
+					if idx in self.stable_eye_positions:
+						del self.stable_eye_positions[idx]
+
 	def _get_eye_positions(self, screen_w, screen_h):
-		"""Get screen positions for ONLY the two eyes"""
+		"""Get stable eye positions for ONLY the two eyes"""
 		if self.face_keypoints is None or not self.eye_tile:
 			return []
 
+		# Update stability first
+		self._update_eye_stability(screen_w, screen_h)
+
+		# Return stable positions
 		positions = []
-		# COCO keypoint indices: 1=left_eye, 2=right_eye (ONLY THESE TWO)
-		eye_indices = [1, 2]  # Only actual eyes, not nose/ears
+		eye_names = {1: "left_eye", 2: "right_eye"}
 
-		print(f"DEBUG: Processing eye keypoints with transformations")
+		for eye_idx, position in self.stable_eye_positions.items():
+			positions.append(position)
+			eye_name = eye_names.get(eye_idx, f"eye_{eye_idx}")
+			print(f"DEBUG: Stable {eye_name} at ({position[0]}, {position[1]})")
 
-		for idx in eye_indices:
-			if idx < len(self.face_keypoints):
-				x, y, visibility = self.face_keypoints[idx]
-				eye_name = "left_eye" if idx == 1 else "right_eye"
-				print(f"DEBUG: {eye_name} (kp{idx}): original x={x}, y={y}, vis={visibility}")
-
-				if visibility > 0.3:  # Threshold for visibility
-					# Transform keypoint through the same pipeline as video
-					screen_x, screen_y = self._transform_keypoint_to_screen(x, y)
-
-					if screen_x is not None and screen_y is not None:
-						# Clamp to screen bounds
-						screen_x = max(0, min(screen_x, screen_w - 1))
-						screen_y = max(0, min(screen_y, screen_h - 1))
-
-						positions.append((screen_x, screen_y))
-						print(f"DEBUG: {eye_name} transformed to screen coords ({screen_x}, {screen_y})")
-					else:
-						print(f"DEBUG: {eye_name} transformation failed (outside crop region)")
-
-		print(f"DEBUG: Found {len(positions)} transformed eye positions")
+		print(f"DEBUG: {len(positions)} stable eye positions")
 		return positions
 
 	def _is_eye_position(self, tile_x, tile_y, tile_size, screen_w, screen_h):
@@ -401,11 +440,12 @@ class TileFilter:
 			tile_right = tile_x + tile_size
 			tile_bottom = tile_y + tile_size
 
-			# Debug: Check specific eye positions
-			if eye_x >= 980 and eye_x <= 1020 and eye_y >= 740 and eye_y <= 780:
-				print(f"DEBUG: Checking tile ({tile_x},{tile_y},{tile_size}) vs eye ({eye_x},{eye_y})")
-				print(f"DEBUG: Eye tile size is {self.eye_tile_size}, current tile size is {tile_size}")
-				print(f"DEBUG: Tile bounds: {tile_x}-{tile_right}, {tile_y}-{tile_bottom}")
+			# Debug output for tiles near eye positions
+			if (abs(tile_x - eye_x) < 100 and abs(tile_y - eye_y) < 100):
+				print(f"DEBUG: Near eye ({eye_x},{eye_y}) - checking tile ({tile_x},{tile_y},{tile_size})")
+				print(f"DEBUG: Eye tile size is {self.eye_tile_size}, tile bounds: {tile_x}-{tile_right}, {tile_y}-{tile_bottom}")
+				print(f"DEBUG: Position check: {tile_x} <= {eye_x} < {tile_right} and {tile_y} <= {eye_y} < {tile_bottom}")
+				print(f"DEBUG: Size match: {tile_size} == {self.eye_tile_size} = {tile_size == self.eye_tile_size}")
 
 			# Check if eye position is within tile bounds
 			if (tile_x <= eye_x < tile_right and
@@ -464,6 +504,10 @@ class TileFilter:
 		# Reset filter rotation cache when pattern changes
 		self.filter_rotation_cache = {}
 		self.filter_rotation_counter = 0
+
+		# Reset eye stability when pattern changes
+		self.eye_detection_history = {}
+		self.stable_eye_positions = {}
 
 		print(f"New pattern generated with seed: {self.current_seed}")
 
@@ -625,6 +669,32 @@ class TileFilter:
 							img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=True)
 							screen.blit(img_s, (i, j))
 
+	def _draw_eye_tiles_on_top(self, screen, screen_w, screen_h):
+		"""Draw eye tiles on top of existing tiles, aligned to grid"""
+		if not self.eye_tile or self.face_keypoints is None or self.eye_image is None:
+			return
+
+		eye_positions = self._get_eye_positions(screen_w, screen_h)
+		base_step = self.min_step  # Use smallest tile size for grid alignment
+
+		for eye_x, eye_y in eye_positions:
+			# Snap eye position to grid
+			grid_x = (eye_x // base_step) * base_step
+			grid_y = (eye_y // base_step) * base_step
+
+			# Draw eye tile at grid position
+			rotation_key = f"eye_overlay_{grid_x}_{grid_y}"
+			img_s = self._get_rotated_tile(self.eye_image, self.eye_tile_size, rotation_key, is_noise_mode=False)
+
+			# Center the eye tile on the grid position
+			draw_x = grid_x
+			draw_y = grid_y
+
+			# Make sure it stays within screen bounds
+			if draw_x + self.eye_tile_size <= screen_w and draw_y + self.eye_tile_size <= screen_h:
+				screen.blit(img_s, (draw_x, draw_y))
+				print(f"DEBUG: Drew eye tile at grid position ({draw_x}, {draw_y}) for eye at ({eye_x}, {eye_y})")
+
 	def apply_tiles(self, screen, frame):
 		"""
 		Apply tile pattern based on frame brightness (face detected)
@@ -699,18 +769,11 @@ class TileFilter:
 
 						# Bounds check
 						if idx < len(self.images):
-							# Check if this position should show eye tile
-							if self._is_eye_position(i, j, step, screen_w, screen_h):
-								# Draw eye tile instead
-								rotation_key = f"eye_detect_{i}_{j}_{step}"
-								img_s = self._get_rotated_tile(self.eye_image, step, rotation_key, is_noise_mode=False)
-								screen.blit(img_s, (i, j))
-							else:
-								# Draw normal tile with static rotation
-								img = self.images[idx]
-								rotation_key = f"detect_{i}_{j}_{step}_{idx}"
-								img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=False)
-								screen.blit(img_s, (i, j))
+							# Draw normal tile (no longer checking for eye replacement)
+							img = self.images[idx]
+							rotation_key = f"detect_{i}_{j}_{step}_{idx}"
+							img_s = self._get_rotated_tile(img, step, rotation_key, is_noise_mode=False)
+							screen.blit(img_s, (i, j))
 
 							# Mark this area and overlapping areas as filled
 							for dy in range(0, step, base_step):
@@ -741,18 +804,14 @@ class TileFilter:
 						idx = 0
 
 					if idx < len(self.images):
-						# Check if this position should show eye tile
-						if self._is_eye_position(i, j, base_step, screen_w, screen_h):
-							# Draw eye tile for gap fill
-							rotation_key = f"eye_fill_{i}_{j}"
-							img_s = self._get_rotated_tile(self.eye_image, base_step, rotation_key, is_noise_mode=False)
-							screen.blit(img_s, (i, j))
-						else:
-							# Draw normal gap-filling tile
-							img = self.images[idx]
-							rotation_key = f"detect_fill_{i}_{j}_{idx}"
-							img_s = self._get_rotated_tile(img, base_step, rotation_key, is_noise_mode=False)
-							screen.blit(img_s, (i, j))
+						# Draw normal gap-filling tile (no eye replacement)
+						img = self.images[idx]
+						rotation_key = f"detect_fill_{i}_{j}_{idx}"
+						img_s = self._get_rotated_tile(img, base_step, rotation_key, is_noise_mode=False)
+						screen.blit(img_s, (i, j))
+
+		# FINAL PASS: Draw eye tiles on top of everything
+		self._draw_eye_tiles_on_top(screen, screen_w, screen_h)
 
 	def generate_new_pattern(self):
 		"""Public method to generate new pattern (like pressing a key in Processing)"""
