@@ -1,0 +1,13 @@
+modules:
+  - capture
+
+capture:
+  # Optional overrides. Defaults are:
+  #   resolution: [2028, 1520]
+  #   rotation:   90
+  #   mirror:     true
+  #   framerate:  30
+  # resolution: [1280, 720]
+  # rotation:   0
+  # mirror:     false
+  # framerate:  24
