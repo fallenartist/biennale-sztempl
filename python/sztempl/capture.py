@@ -80,6 +80,16 @@ class FaceShoulderApp:
 		self.current_frame  = None
 		self.debug_mode     = False
 
+		# Pose detection stabilization - CONFIGURABLE VARIABLES
+		self.pose_stability_window = 30   # Frames to consider for stability
+		self.pose_switch_threshold = 0.7  # 70% of frames must agree to switch
+		self.min_mode_duration = 3.0      # Minimum seconds before allowing mode switch
+
+		# Stabilization state (don't change these)
+		self.pose_detection_history = []  # Track recent detections
+		self.stable_pose_detected = False  # The stable state we use for display
+		self.last_mode_switch_time = 0     # When we last switched modes
+
 		# Camera init
 		self.setup_imx500_camera()
 
@@ -93,16 +103,17 @@ class FaceShoulderApp:
 			enable_rotation=True,
 			enable_noise_random_rotation=True,
 			noise_rotation_interval=60,
-			enable_filter_random_rotation=True,
-			filter_rotation_interval=60
+			enable_filter_random_rotation=False,
+			filter_rotation_interval=45
 		)
 
-		self.tile_filter.set_noise_size_distribution({40: 6, 80: 3, 120: 1})
-		self.tile_filter.set_filter_size_distribution({40: 7, 80: 2, 120: 1})
+		# Configure tile distributions
+		self.tile_filter.set_noise_size_distribution({40: 1, 80: 4, 120: 3})
+		self.tile_filter.set_filter_size_distribution({40: 3, 80: 2, 120: 1})
 
 		print(f"Display: {self.display_width}x{self.display_height}, "
-			  f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
-		print("ESC: exit | d: debug | r: rotate toggle | m: mirror toggle")
+		  	f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
+		print("ESC: exit | d: debug toggle")
 
 	def setup_imx500_camera(self):
 		try:
@@ -133,7 +144,7 @@ class FaceShoulderApp:
 				self.actual_camera_resolution[0]
 			)
 			print("IMX500 ready:", self.actual_camera_resolution,
-				  self.intrinsics.inference_rate)
+			  	self.intrinsics.inference_rate)
 		except Exception as e:
 			print(f"Camera init fail: {e}", file=sys.stderr)
 			# Fallback to plain Picamera2
@@ -251,6 +262,45 @@ class FaceShoulderApp:
 		f.blit(s, ((tw - nw) // 2, (th - nh) // 2))
 		return f
 
+	def update_pose_stability(self):
+		"""Update the stable pose detection state based on recent history"""
+		import time
+
+		# Add current detection to history
+		self.pose_detection_history.append(self.pose_detected)
+
+		# Keep only recent history
+		if len(self.pose_detection_history) > self.pose_stability_window:
+			self.pose_detection_history.pop(0)
+
+		# Calculate percentage of recent frames with pose detection
+		if len(self.pose_detection_history) >= self.pose_stability_window:
+			detection_ratio = sum(self.pose_detection_history) / len(self.pose_detection_history)
+
+			# Determine what the stable state should be
+			should_be_detected = detection_ratio >= self.pose_switch_threshold
+			should_be_noise = detection_ratio <= (1.0 - self.pose_switch_threshold)
+
+			# Check if enough time has passed since last switch
+			current_time = time.time()
+			time_since_switch = current_time - self.last_mode_switch_time
+
+			# Only switch if enough time has passed AND we have a clear decision
+			if time_since_switch >= self.min_mode_duration:
+				if should_be_detected and not self.stable_pose_detected:
+					# Switch to filter mode
+					self.stable_pose_detected = True
+					self.last_mode_switch_time = current_time
+					if self.debug_mode:
+						print(f"Switched to FILTER mode (detection ratio: {detection_ratio:.2f})")
+
+				elif should_be_noise and self.stable_pose_detected:
+					# Switch to noise mode
+					self.stable_pose_detected = False
+					self.last_mode_switch_time = current_time
+					if self.debug_mode:
+						print(f"Switched to NOISE mode (detection ratio: {detection_ratio:.2f})")
+
 	def get_processed_frame_for_tiles(self):
 		"""
 		Process the frame exactly like your original logic for human detection,
@@ -309,9 +359,12 @@ class FaceShoulderApp:
 
 	def draw_video_display(self):
 		"""
-		Main drawing function that applies tile filter to processed frames.
+		Main drawing function with stabilized mode switching
 		"""
 		self.update_fps()
+
+		# Update pose stability (this determines the stable mode)
+		self.update_pose_stability()
 
 		# Clear screen
 		self.screen.fill(self.offwhite)
@@ -323,11 +376,12 @@ class FaceShoulderApp:
 			self.screen.blit(t, r)
 			return
 
-		if not self.pose_detected:
-			# No person detected - show tile noise
+		# Use STABLE pose detection state for display mode
+		if not self.stable_pose_detected:
+			# No person detected (stable) - show tile noise
 			self.tile_filter.apply_noise(self.screen)
 		else:
-			# Person detected - get processed frame and apply tile mosaic
+			# Person detected (stable) - get processed frame and apply tile mosaic
 			processed_frame = self.get_processed_frame_for_tiles()
 			if processed_frame is not None:
 				self.tile_filter.apply_tiles(self.screen, processed_frame)
@@ -367,16 +421,19 @@ class FaceShoulderApp:
 		for a, b in [(0,1), (0,2), (1,3), (2,4)]:
 			if a in scr_pts and b in scr_pts:
 				pygame.draw.line(self.screen, self.white,
-								 scr_pts[a], scr_pts[b], 2)
+							 	scr_pts[a], scr_pts[b], 2)
 		if 5 in scr_pts and 6 in scr_pts:
 			pygame.draw.line(self.screen, self.green,
-							 scr_pts[5], scr_pts[6], 2)
+						 	scr_pts[5], scr_pts[6], 2)
 		for j in scr_pts:
 			col = self.red if j == 0 else (self.white if j < 5 else self.green)
 			pygame.draw.circle(self.screen, col, scr_pts[j], 8)
 
 	def draw_status_overlay(self):
+		"""Status overlay with stability info in debug mode"""
 		font = pygame.font.Font(None, 48)
+
+		# FPS display
 		fps_text = f"FPS: {self.current_fps:.1f}"
 		if self.rotate_90_degrees:
 			txt = pygame.transform.rotate(font.render(fps_text, True, self.white), 90)
@@ -386,6 +443,7 @@ class FaceShoulderApp:
 			pos = (self.display_width - 200, 20)
 		self.screen.blit(txt, pos)
 
+		# Camera resolution
 		if hasattr(self, 'actual_camera_resolution'):
 			res = f"CAM: {self.actual_camera_resolution[0]}x{self.actual_camera_resolution[1]}"
 			if self.rotate_90_degrees:
@@ -396,7 +454,27 @@ class FaceShoulderApp:
 				rp = (self.display_width - 300, 70)
 			self.screen.blit(rt, rp)
 
+		# Show stability info only in debug mode
+		if self.debug_mode:
+			if len(self.pose_detection_history) >= self.pose_stability_window:
+				detection_ratio = sum(self.pose_detection_history) / len(self.pose_detection_history)
+				status_text = f"{'FILTER' if self.stable_pose_detected else 'NOISE'} ({detection_ratio:.0%})"
+			else:
+				status_text = f"{'FILTER' if self.stable_pose_detected else 'NOISE'} (stabilizing...)"
+
+			# Color code the status
+			status_color = self.green if self.stable_pose_detected else self.white
+
+			if self.rotate_90_degrees:
+				st = pygame.transform.rotate(font.render(status_text, True, status_color), 90)
+				sp = (self.display_width - 20, 20 + txt.get_width() + rt.get_width() + 20)
+			else:
+				st = font.render(status_text, True, status_color)
+				sp = (self.display_width - 400, 120)
+			self.screen.blit(st, sp)
+
 	def handle_events(self):
+		"""Event handling - only debug toggle"""
 		for e in pygame.event.get():
 			if e.type == pygame.QUIT:
 				return False
@@ -406,24 +484,6 @@ class FaceShoulderApp:
 				if e.key == pygame.K_d:
 					self.debug_mode = not self.debug_mode
 					print("Debug mode", self.debug_mode)
-				if e.key == pygame.K_r:
-					self.rotate_90_degrees = not self.rotate_90_degrees
-					if self.rotate_90_degrees:
-						self.display_width, self.display_height = (
-							self.fullhd_height, self.fullhd_width
-						)
-					else:
-						self.display_width, self.display_height = (
-							self.fullhd_width, self.fullhd_height
-						)
-					self.screen = pygame.display.set_mode(
-						(self.display_width, self.display_height),
-						pygame.FULLSCREEN
-					)
-					print(f"Rotation set to {90 if self.rotate_90_degrees else 0}°")
-				if e.key == pygame.K_m:
-					self.mirror_horizontally = not self.mirror_horizontally
-					print("Mirror set to", self.mirror_horizontally)
 		return True
 
 	def run(self):
@@ -440,7 +500,6 @@ class FaceShoulderApp:
 			pass
 		pygame.quit()
 		logger.info("Camera loop exited and Pygame quit")
-
 
 def register(app_context):
 	"""Plugin hook: instantiate and run on start()."""
