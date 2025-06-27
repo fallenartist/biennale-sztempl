@@ -3,6 +3,7 @@
 import sys
 import time
 import logging
+import os
 
 import numpy as np
 import pygame
@@ -12,6 +13,7 @@ from picamera2.devices.imx500 import IMX500, NetworkIntrinsics
 from picamera2.devices.imx500.postprocess_highernet import postprocess_higherhrnet
 
 from sztempl.config import settings
+from sztempl.tile_filter import TileFilter
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ class FaceShoulderApp:
 		# Colors
 		self.black = (0, 0, 0)
 		self.white = (255, 255, 255)
+		self.offwhite = (225, 225, 225)
 		self.green = (0, 255, 0)
 		self.red   = (255, 0, 0)
 
@@ -81,6 +84,10 @@ class FaceShoulderApp:
 		self.setup_imx500_camera()
 
 		self.clock = pygame.time.Clock()
+
+		# Tiles - Using larger tile sizes
+		tiles_dir = os.path.join(os.path.dirname(__file__), "tiles")
+		self.tile_filter = TileFilter(tiles_dir, cell_sizes=[40, 80, 120])  # Larger tiles
 
 		print(f"Display: {self.display_width}x{self.display_height}, "
 			  f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
@@ -233,9 +240,71 @@ class FaceShoulderApp:
 		f.blit(s, ((tw - nw) // 2, (th - nh) // 2))
 		return f
 
+	def get_processed_frame_for_tiles(self):
+		"""
+		Process the frame exactly like your original logic for human detection,
+		but return the processed frame as a numpy array for tile processing.
+		"""
+		if self.current_frame is None:
+			return None
+
+		try:
+			# Start with BGR to RGB conversion
+			rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+
+			# Create pygame surface for processing
+			surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+
+			# Apply your exact framing logic
+			crop = self.get_face_shoulder_crop_region()
+			if crop and self.pose_detected:
+				x, y, w, h = crop
+				if w > 0 and h > 0:
+					# Crop to face/shoulder region
+					cs = pygame.Surface((w, h))
+					cs.blit(surf, (0, 0), (x, y, w, h))
+					# Scale to display size
+					ds = pygame.transform.scale(
+						cs, (self.display_width, self.display_height)
+					)
+				else:
+					# Scale with aspect ratio
+					ds = self.scale_with_aspect_ratio(
+						surf, self.display_width, self.display_height
+					)
+			else:
+				# Scale with aspect ratio
+				ds = self.scale_with_aspect_ratio(
+					surf, self.display_width, self.display_height
+				)
+
+			# Apply mirror and rotation transforms
+			if self.mirror_horizontally:
+				ds = pygame.transform.flip(ds, True, False)
+			if self.rotate_90_degrees:
+				ds = pygame.transform.rotate(ds, 90)
+
+			# Convert back to numpy array for tile processing
+			# pygame surface to numpy array
+			frame_array = pygame.surfarray.array3d(ds)
+			# Swap axes back to normal image format (height, width, channels)
+			frame_array = frame_array.swapaxes(0, 1)
+
+			return frame_array
+
+		except Exception as e:
+			print(f"Frame processing error: {e}", file=sys.stderr)
+			return None
+
 	def draw_video_display(self):
+		"""
+		Main drawing function that applies tile filter to processed frames.
+		"""
 		self.update_fps()
-		self.screen.fill(self.black)
+
+		# Clear screen
+		self.screen.fill(self.offwhite)
+
 		if self.current_frame is None:
 			font = pygame.font.Font(None, 74)
 			t = font.render("Initializing camera...", True, self.white)
@@ -243,43 +312,22 @@ class FaceShoulderApp:
 			self.screen.blit(t, r)
 			return
 
-		try:
-			rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
-			surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
-			crop = self.get_face_shoulder_crop_region()
-			if crop and self.pose_detected:
-				x, y, w, h = crop
-				if w > 0 and h > 0:
-					cs = pygame.Surface((w, h))
-					cs.blit(surf, (0, 0), (x, y, w, h))
-					ds = pygame.transform.scale(
-						cs, (self.display_width, self.display_height)
-					)
-				else:
-					ds = self.scale_with_aspect_ratio(
-						surf, self.display_width, self.display_height
-					)
+		if not self.pose_detected:
+			# No person detected - show tile noise
+			self.tile_filter.apply_noise(self.screen)
+		else:
+			# Person detected - get processed frame and apply tile mosaic
+			processed_frame = self.get_processed_frame_for_tiles()
+			if processed_frame is not None:
+				self.tile_filter.apply_tiles(self.screen, processed_frame)
 			else:
-				ds = self.scale_with_aspect_ratio(
-					surf, self.display_width, self.display_height
-				)
+				# Fallback to noise if processing fails
+				self.tile_filter.apply_noise(self.screen)
 
-			if self.mirror_horizontally:
-				ds = pygame.transform.flip(ds, True, False)
-			if self.rotate_90_degrees:
-				ds = pygame.transform.rotate(ds, 90)
-			self.screen.blit(ds, (0, 0))
-
-			if self.debug_mode:
-				self.draw_pose_debug_overlay()
-			self.draw_status_overlay()
-
-		except Exception as e:
-			print(f"Video draw error: {e}", file=sys.stderr)
-			font = pygame.font.Font(None, 48)
-			t = font.render(f"Video error: {e}", True, self.red)
-			r = t.get_rect(center=(self.display_width//2, self.display_height//2))
-			self.screen.blit(t, r)
+		# Draw overlays
+		if self.debug_mode:
+			self.draw_pose_debug_overlay()
+		self.draw_status_overlay()
 
 	def draw_pose_debug_overlay(self):
 		if not self.pose_detected:
