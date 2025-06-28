@@ -174,8 +174,8 @@ class TileFilter:
 		# Slow tile size variation for detection mode
 		self.detection_size_cache = {}
 		self.detection_size_update_counter = 0
-		self.detection_size_update_interval = 90  # Update sizes every 30 frames (slow)
-		self.detection_size_update_probability = 0.005  # 2% chance per position per frame
+		self.detection_size_update_interval = 90  # Update sizes every 90 frames (slow)
+		self.detection_size_update_probability = 0.005  # 0.5% chance per position per update cycle
 
 		# Noise mode random rotation system
 		self.noise_rotation_cache = {}
@@ -547,9 +547,11 @@ class TileFilter:
 		if position_key not in self.detection_size_cache:
 			self.detection_size_cache[position_key] = random.choice(size_choices)
 
-		# Randomly update this position's size (smooth distributed changes)
-		if random.random() < self.detection_size_update_probability:
-			self.detection_size_cache[position_key] = random.choice(size_choices)
+		# FIXED: Only update tile sizes at specified intervals
+		if self.detection_size_update_counter % self.detection_size_update_interval == 0:
+			# Randomly update this position's size (smooth distributed changes)
+			if random.random() < self.detection_size_update_probability:
+				self.detection_size_cache[position_key] = random.choice(size_choices)
 
 		return self.detection_size_cache[position_key]
 
@@ -870,3 +872,21 @@ class TileFilter:
 		self.filter_size_distribution = distribution
 		self._update_size_choices()
 		print(f"Filter size distribution updated: {distribution}")
+
+	def set_detection_size_update_settings(self, interval_frames=90, probability=0.005):
+		"""
+		Set the tile size update settings for detection mode
+		interval_frames: int, frames between update cycles
+		probability: float, probability per position per update cycle (0.0-1.0)
+		"""
+		self.detection_size_update_interval = interval_frames
+		self.detection_size_update_probability = probability
+		print(f"Detection size update settings: interval={interval_frames} frames, probability={probability}")
+
+	def get_detection_size_update_settings(self):
+		"""Get current detection size update settings"""
+		return {
+			'interval': self.detection_size_update_interval,
+			'probability': self.detection_size_update_probability,
+			'counter': self.detection_size_update_counter
+		}
