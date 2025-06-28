@@ -100,21 +100,32 @@ class FaceShoulderApp:
 		self.tile_filter = TileFilter(
 			tiles_dir,
 			cell_sizes=[40, 80, 120],
-			enable_rotation=True,
+			enable_rotation=False,
 			enable_noise_random_rotation=True,
 			noise_rotation_interval=60,
 			enable_filter_random_rotation=False,
 			filter_rotation_interval=45,
-			eye_tile=True  # Enable eye tile feature
+			eye_tile=True
 		)
 
 		# Configure tile distributions
 		self.tile_filter.set_noise_size_distribution({40: 1, 80: 4, 120: 3})
-		self.tile_filter.set_filter_size_distribution({40: 3, 80: 2, 120: 1})
+		self.tile_filter.set_filter_size_distribution({40: 6, 80: 3, 120: 1})
+
+		# Genetic mutation module
+		try:
+			from sztempl.genetic_mutation import GeneticMutationModule
+			self.genetic_module = GeneticMutationModule(tiles_dir, gpio_pin=18)
+			self.genetic_enabled = True
+		except ImportError as e:
+			self.genetic_module = None
+			self.genetic_enabled = False
 
 		print(f"Display: {self.display_width}x{self.display_height}, "
-		  	f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
+			  f"rotate90={self.rotate_90_degrees}, mirror={self.mirror_horizontally}")
 		print("ESC: exit | d: debug toggle")
+		if self.genetic_enabled:
+			print("SPACE: toggle genetic mutation mode")
 
 	def setup_imx500_camera(self):
 		try:
@@ -145,7 +156,7 @@ class FaceShoulderApp:
 				self.actual_camera_resolution[0]
 			)
 			print("IMX500 ready:", self.actual_camera_resolution,
-			  	self.intrinsics.inference_rate)
+				  self.intrinsics.inference_rate)
 		except Exception as e:
 			print(f"Camera init fail: {e}", file=sys.stderr)
 			# Fallback to plain Picamera2
@@ -302,10 +313,12 @@ class FaceShoulderApp:
 					if self.debug_mode:
 						print(f"Switched to NOISE mode (detection ratio: {detection_ratio:.2f})")
 
-	def get_processed_frame_for_tiles(self):
+	def get_processed_frame_for_tiles(self, use_person_crop=False):
 		"""
-		Process the frame exactly like your original logic for human detection,
-		but return the processed frame as a numpy array for tile processing.
+		Process the frame for tile processing.
+
+		use_person_crop: If True, crops around detected person (for genetic mutation).
+						If False, uses center crop to TV proportions (default for tile filter).
 		"""
 		if self.current_frame is None:
 			return None
@@ -317,28 +330,57 @@ class FaceShoulderApp:
 			# Create pygame surface for processing
 			surf = pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
 
-			# Apply your exact framing logic
-			crop = self.get_face_shoulder_crop_region()
-			if crop and self.pose_detected:
-				x, y, w, h = crop
-				if w > 0 and h > 0:
-					# Crop to face/shoulder region
-					cs = pygame.Surface((w, h))
-					cs.blit(surf, (0, 0), (x, y, w, h))
-					# Scale to display size
-					ds = pygame.transform.scale(
-						cs, (self.display_width, self.display_height)
-					)
+			# Apply framing logic based on use_person_crop parameter
+			if use_person_crop:
+				# OLD BEHAVIOR: Crop around detected person (for genetic mutation)
+				crop = self.get_face_shoulder_crop_region()
+				if crop and self.pose_detected:
+					x, y, w, h = crop
+					if w > 0 and h > 0:
+						# Crop to face/shoulder region
+						cs = pygame.Surface((w, h))
+						cs.blit(surf, (0, 0), (x, y, w, h))
+						# Scale to display size
+						ds = pygame.transform.scale(
+							cs, (self.display_width, self.display_height)
+						)
+					else:
+						# Scale with aspect ratio
+						ds = self.scale_with_aspect_ratio(
+							surf, self.display_width, self.display_height
+						)
 				else:
 					# Scale with aspect ratio
 					ds = self.scale_with_aspect_ratio(
 						surf, self.display_width, self.display_height
 					)
 			else:
-				# Scale with aspect ratio
-				ds = self.scale_with_aspect_ratio(
-					surf, self.display_width, self.display_height
-				)
+				# NEW DEFAULT BEHAVIOR: Center crop to TV proportions (1080x1920)
+				camera_w, camera_h = surf.get_size()
+
+				# Calculate target crop size (TV proportions before rotation)
+				target_aspect = self.display_height / self.display_width  # 1920/1080 = 16:9 portrait
+
+				# Determine crop size based on camera aspect ratio
+				if camera_w / camera_h > 1 / target_aspect:
+					# Camera is wider - crop width to match height
+					crop_h = camera_h
+					crop_w = int(camera_h / target_aspect)
+				else:
+					# Camera is taller - crop height to match width
+					crop_w = camera_w
+					crop_h = int(camera_w * target_aspect)
+
+				# Center the crop
+				crop_x = (camera_w - crop_w) // 2
+				crop_y = (camera_h - crop_h) // 2
+
+				# Extract center crop
+				cs = pygame.Surface((crop_w, crop_h))
+				cs.blit(surf, (0, 0), (crop_x, crop_y, crop_w, crop_h))
+
+				# Scale to display size (before rotation)
+				ds = pygame.transform.scale(cs, (self.display_width, self.display_height))
 
 			# Apply mirror and rotation transforms
 			if self.mirror_horizontally:
@@ -360,7 +402,7 @@ class FaceShoulderApp:
 
 	def draw_video_display(self):
 		"""
-		Main drawing function with stabilized mode switching
+		Main drawing function with stabilized mode switching and genetic mutation
 		"""
 		self.update_fps()
 
@@ -377,34 +419,69 @@ class FaceShoulderApp:
 			self.screen.blit(t, r)
 			return
 
-		# Use STABLE pose detection state for display mode
-		if not self.stable_pose_detected:
-			# No person detected (stable) - show tile noise
-			self.tile_filter.apply_noise(self.screen)
+		# Check GPIO trigger regardless of genetic mode state
+		if self.genetic_enabled and self.genetic_module and self.genetic_module.gpio_enabled:
+			if self.genetic_module.check_gpio_trigger():
+				self._toggle_genetic_mode()
+
+		# Update genetic mutation if active
+		if self.genetic_enabled and self.genetic_module and self.genetic_module.is_active:
+			self.genetic_module.update()
+
+			# Draw genetic mosaic instead of normal tiles
+			display_rect = pygame.Rect(0, 0, self.display_width, self.display_height)
+			self.genetic_module.draw_mosaic(self.screen, display_rect)
+
+			# Draw debug mask in debug mode
+			if self.debug_mode:
+				self.genetic_module.draw_debug_mask(self.screen, display_rect)
+
+			# Draw progress bar
+			self.genetic_module.draw_progress_bar(self.screen)
+
 		else:
-			# Person detected (stable) - get processed frame and apply tile mosaic
-			processed_frame = self.get_processed_frame_for_tiles()
-			if processed_frame is not None:
-				# Pass face keypoints to tile filter for eye tile positioning
-				if self.pose_detected and self.last_keypoints is not None and len(self.last_keypoints) > 0:
-					# Get the best person's keypoints (highest confidence)
-					best_person_idx = np.argmax(self.last_scores)
-					face_keypoints = self.last_keypoints[best_person_idx]
-
-					# Pass all transformation parameters so keypoints follow same pipeline as video
-					self.tile_filter.set_face_keypoints(
-						face_keypoints,
-						camera_resolution=self.camera_resolution,
-						crop_region=self.get_face_shoulder_crop_region(),
-						display_size=(self.display_width, self.display_height),
-						mirror=self.mirror_horizontally,
-						rotate_90=self.rotate_90_degrees
-					)
-
-				self.tile_filter.apply_tiles(self.screen, processed_frame)
-			else:
-				# Fallback to noise if processing fails
+			# Normal tile filter operation
+			if not self.stable_pose_detected:
+				# No person detected (stable) - show tile noise
 				self.tile_filter.apply_noise(self.screen)
+			else:
+				# Person detected (stable) - get processed frame and apply tile mosaic
+				processed_frame = self.get_processed_frame_for_tiles()
+				if processed_frame is not None:
+					# Pass face keypoints to tile filter for eye tile positioning
+					# Transform keypoints through same center crop pipeline
+					if self.pose_detected and self.last_keypoints is not None and len(self.last_keypoints) > 0:
+						best_person_idx = np.argmax(self.last_scores)
+						face_keypoints = self.last_keypoints[best_person_idx]
+
+						# Pass center crop parameters instead of person crop
+						camera_w, camera_h = self.camera_resolution
+						target_aspect = self.display_height / self.display_width
+
+						if camera_w / camera_h > 1 / target_aspect:
+							crop_h = camera_h
+							crop_w = int(camera_h / target_aspect)
+						else:
+							crop_w = camera_w
+							crop_h = int(camera_w * target_aspect)
+
+						crop_x = (camera_w - crop_w) // 2
+						crop_y = (camera_h - crop_h) // 2
+						center_crop_region = (crop_x, crop_y, crop_w, crop_h)
+
+						self.tile_filter.set_face_keypoints(
+							face_keypoints,
+							camera_resolution=self.camera_resolution,
+							crop_region=center_crop_region,  # Use center crop instead of person crop
+							display_size=(self.display_width, self.display_height),
+							mirror=self.mirror_horizontally,
+							rotate_90=self.rotate_90_degrees
+						)
+
+					self.tile_filter.apply_tiles(self.screen, processed_frame)
+				else:
+					# Fallback to noise if processing fails
+					self.tile_filter.apply_noise(self.screen)
 
 		# Draw overlays
 		if self.debug_mode:
@@ -417,31 +494,64 @@ class FaceShoulderApp:
 		idx = np.argmax(self.last_scores)
 		pts = self.last_keypoints[idx]
 		inds = [0, 1, 2, 3, 4, 5, 6]
-		crop = self.get_face_shoulder_crop_region()
+
+		# For debug overlay, we need to transform keypoints through the same pipeline as the image
+		camera_w, camera_h = self.camera_resolution
+
+		# Calculate center crop parameters (same as in get_processed_frame_for_tiles)
+		target_aspect = self.display_height / self.display_width  # 1920/1080 = portrait aspect
+
+		if camera_w / camera_h > 1 / target_aspect:
+			# Camera is wider - crop width to match height
+			crop_h = camera_h
+			crop_w = int(camera_h / target_aspect)
+		else:
+			# Camera is taller - crop height to match width
+			crop_w = camera_w
+			crop_h = int(camera_w * target_aspect)
+
+		# Center the crop
+		crop_x = (camera_w - crop_w) // 2
+		crop_y = (camera_h - crop_h) // 2
+
 		scr_pts = {}
 		for j in inds:
 			x, y, v = pts[j]
 			if v > self.visibility_threshold:
-				if crop:
-					cx, cy, cw, ch = crop
-					rx, ry = (x - cx) / cw, (y - cy) / ch
-					sx, sy = rx * self.display_width, ry * self.display_height
-				else:
-					sx = x / self.camera_resolution[0] * self.display_width
-					sy = y / self.camera_resolution[1] * self.display_height
+				# Transform keypoint through same pipeline as image:
+				# 1. Apply center crop
+				x_cropped = x - crop_x
+				y_cropped = y - crop_y
+
+				# Skip if outside crop region
+				if x_cropped < 0 or x_cropped >= crop_w or y_cropped < 0 or y_cropped >= crop_h:
+					continue
+
+				# 2. Scale to display size (before rotation)
+				sx = x_cropped * self.display_width / crop_w
+				sy = y_cropped * self.display_height / crop_h
+
+				# 3. Apply mirror transform
 				if self.mirror_horizontally:
 					sx = self.display_width - sx
+
+				# 4. Apply rotation transform
 				if self.rotate_90_degrees:
-					sx, sy = sy, self.display_width - sx
+					# 90 degree CCW rotation: (x,y) -> (-y, x) but adjust for screen coordinates
+					new_x = sy
+					new_y = self.display_width - sx
+					sx, sy = new_x, new_y
+
 				scr_pts[j] = (int(sx), int(sy))
 
+		# Draw pose skeleton
 		for a, b in [(0,1), (0,2), (1,3), (2,4)]:
 			if a in scr_pts and b in scr_pts:
 				pygame.draw.line(self.screen, self.white,
-							 	scr_pts[a], scr_pts[b], 2)
+								 scr_pts[a], scr_pts[b], 2)
 		if 5 in scr_pts and 6 in scr_pts:
 			pygame.draw.line(self.screen, self.green,
-						 	scr_pts[5], scr_pts[6], 2)
+							 scr_pts[5], scr_pts[6], 2)
 		for j in scr_pts:
 			col = self.red if j == 0 else (self.white if j < 5 else self.green)
 			pygame.draw.circle(self.screen, col, scr_pts[j], 8)
@@ -471,27 +581,47 @@ class FaceShoulderApp:
 				rp = (self.display_width - 300, 70)
 			self.screen.blit(rt, rp)
 
+		# Show genetic mode status
+		if self.genetic_enabled and self.genetic_module:
+			if self.genetic_module.is_active:
+				mode_text = "GENETIC"
+				mode_color = (255, 100, 0)  # Orange
+			else:
+				mode_text = f"{'FILTER' if self.stable_pose_detected else 'NOISE'}"
+				mode_color = self.green if self.stable_pose_detected else self.white
+
+			if self.rotate_90_degrees:
+				mt = pygame.transform.rotate(font.render(mode_text, True, mode_color), 90)
+				mp = (self.display_width - 20, 20 + txt.get_width() + rt.get_width() + 20)
+			else:
+				mt = font.render(mode_text, True, mode_color)
+				mp = (self.display_width - 400, 120)
+			self.screen.blit(mt, mp)
+
 		# Show stability info only in debug mode
 		if self.debug_mode:
 			if len(self.pose_detection_history) >= self.pose_stability_window:
 				detection_ratio = sum(self.pose_detection_history) / len(self.pose_detection_history)
-				status_text = f"{'FILTER' if self.stable_pose_detected else 'NOISE'} ({detection_ratio:.0%})"
+				status_text = f"({detection_ratio:.0%})"
 			else:
-				status_text = f"{'FILTER' if self.stable_pose_detected else 'NOISE'} (stabilizing...)"
+				status_text = "(stabilizing...)"
 
 			# Color code the status
 			status_color = self.green if self.stable_pose_detected else self.white
 
 			if self.rotate_90_degrees:
 				st = pygame.transform.rotate(font.render(status_text, True, status_color), 90)
-				sp = (self.display_width - 20, 20 + txt.get_width() + rt.get_width() + 20)
+				if self.genetic_enabled and self.genetic_module:
+					sp = (self.display_width - 20, 20 + txt.get_width() + rt.get_width() + mt.get_width() + 30)
+				else:
+					sp = (self.display_width - 20, 20 + txt.get_width() + rt.get_width() + 20)
 			else:
 				st = font.render(status_text, True, status_color)
-				sp = (self.display_width - 400, 120)
+				sp = (self.display_width - 500, 170)
 			self.screen.blit(st, sp)
 
 	def handle_events(self):
-		"""Event handling - only debug toggle"""
+		"""Event handling - debug toggle and genetic mutation space key detection"""
 		for e in pygame.event.get():
 			if e.type == pygame.QUIT:
 				return False
@@ -501,7 +631,26 @@ class FaceShoulderApp:
 				if e.key == pygame.K_d:
 					self.debug_mode = not self.debug_mode
 					print("Debug mode", self.debug_mode)
+
+				# Handle SPACE key for genetic mutation toggle
+				if e.key == pygame.K_SPACE and self.genetic_enabled and self.genetic_module:
+					self._toggle_genetic_mode()
 		return True
+
+	def _toggle_genetic_mode(self):
+		"""Handle genetic mode toggle"""
+		# Get processed frame for genetic mode with person cropping enabled
+		processed_frame = self.get_processed_frame_for_tiles(use_person_crop=True)
+
+		# Toggle genetic mode - use display size for both camera and target since frame is pre-processed
+		target_size = (self.display_width, self.display_height)
+
+		self.genetic_module.toggle_mode(
+			processed_frame,
+			None,  # No keypoints needed for pure Sobel approach
+			target_size,  # Use target_size as camera_resolution since frame is already processed
+			target_size
+		)
 
 	def run(self):
 		# Main blocking loop, exactly like original

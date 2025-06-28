@@ -103,7 +103,7 @@ class TileFilter:
 				 noise_rotation_interval=60,
 				 enable_filter_random_rotation=False,
 				 filter_rotation_interval=45,
-				 eye_tile=False):
+				 eye_tile=True):
 		"""
 		tiles_dir: path to directory containing tiles named '000.png', '012.png', etc.
 		cell_sizes: list of ints, e.g. [40, 80, 120] for small/medium/large tiles.
@@ -174,8 +174,8 @@ class TileFilter:
 		# Slow tile size variation for detection mode
 		self.detection_size_cache = {}
 		self.detection_size_update_counter = 0
-		self.detection_size_update_interval = 30  # Update sizes every 30 frames (slow)
-		self.detection_size_update_probability = 0.02  # 2% chance per position per frame
+		self.detection_size_update_interval = 90  # Update sizes every 30 frames (slow)
+		self.detection_size_update_probability = 0.005  # 2% chance per position per frame
 
 		# Noise mode random rotation system
 		self.noise_rotation_cache = {}
