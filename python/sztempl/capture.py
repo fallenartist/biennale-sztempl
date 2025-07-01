@@ -486,7 +486,7 @@ class FaceShoulderApp:
 		# Draw overlays
 		if self.debug_mode:
 			self.draw_pose_debug_overlay()
-		self.draw_status_overlay()
+			self.draw_status_overlay()
 
 	def draw_pose_debug_overlay(self):
 		if not self.pose_detected:
